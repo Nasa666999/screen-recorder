@@ -37,15 +37,15 @@ func render(size: Int) throws -> CGImage {
     )
     let colors = [
         CGColor(
-            srgbRed: 0.21,
-            green: 0.62,
-            blue: 0.97,
+            srgbRed: 0.33,
+            green: 0.83,
+            blue: 0.95,
             alpha: 1
         ),
         CGColor(
-            srgbRed: 0.09,
-            green: 0.27,
-            blue: 0.68,
+            srgbRed: 0.56,
+            green: 0.43,
+            blue: 0.96,
             alpha: 1
         ),
     ]
