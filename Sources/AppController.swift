@@ -10,6 +10,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var options = RecorderOptions.load()
     private var statusItem: NSStatusItem!
     private var panel: NSPanel!
+    private let toolbarFrameName = "ScreenRecorderToolbar"
     private var modes: NSSegmentedControl!
     private var recordButton: NSButton!
     private var caption: NSTextField!
@@ -111,6 +112,22 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return nil
         }
         let center = NSWorkspace.shared.notificationCenter
+        observers.append(
+            center.addObserver(
+                forName: NSWorkspace.activeSpaceDidChangeNotification, object: nil, queue: .main
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    guard let self else {
+                        return
+                    }
+                    // 切换桌面撤销尚未完成的选择，迟到查询不能在新桌面铺开遮罩；已经开始的录制保留。
+                    self.sourceRequest = nil
+                    self.selection.hide()
+                    if !self.engine.state.isBusy {
+                        self.panel.orderOut(nil)
+                    }
+                }
+            })
         for name in [
             NSWorkspace.willSleepNotification, NSWorkspace.screensDidSleepNotification,
             NSWorkspace.sessionDidResignActiveNotification,
@@ -161,7 +178,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.backgroundColor = .clear
         panel.hasShadow = true
         panel.isMovableByWindowBackground = true
-        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+        panel.collectionBehavior = [.moveToActiveSpace, .fullScreenAuxiliary]
         let effect = NSVisualEffectView(
             frame: NSRect(
                 x: 0,
@@ -261,6 +278,62 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         caption.lineBreakMode = .byTruncatingMiddle
         effect.addSubview(caption)
         panel.contentView = effect
+        restoreToolbarPosition()
+    }
+
+    /// 业务作用: 首次把工具栏放在当前屏幕底部中央，之后恢复用户拖动保存的位置。
+    /// 参数说明: 无。
+    /// 返回: 非可调整大小的工具栏恢复固定尺寸，并开始自动保存窗口位置。
+    private func restoreToolbarPosition() {
+        let restored = panel.setFrameUsingName(toolbarFrameName, force: true)
+        panel.setContentSize(
+            NSSize(
+                width: 496,
+                height: 90
+            ))
+        if !restored {
+            let screen =
+                NSScreen.screens.first {
+                    $0.frame.contains(NSEvent.mouseLocation)
+                } ?? NSScreen.screens[0]
+            panel.setFrameOrigin(
+                NSPoint(
+                    x: screen.visibleFrame.midX - panel.frame.width / 2,
+                    y: screen.visibleFrame.minY + 40
+                ))
+        }
+        ensureToolbarVisible()
+        panel.setFrameAutosaveName(toolbarFrameName)
+    }
+
+    /// 业务作用: 在显示器布局或分辨率改变后保持工具栏可见，不把默认原点当成已保存位置。
+    /// 参数说明: 无。
+    /// 返回: 保留用户位置；仅在越界时限制到有效显示器的安全范围。
+    private func ensureToolbarVisible() {
+        let screens = NSScreen.screens
+        var target =
+            screens.first {
+                $0.frame.contains(NSEvent.mouseLocation)
+            } ?? screens[0]
+        var largestArea: CGFloat = 0
+        for screen in screens {
+            let overlap = screen.visibleFrame.intersection(panel.frame)
+            if !overlap.isNull, !overlap.isEmpty {
+                let area = overlap.width * overlap.height
+                if area > largestArea {
+                    largestArea = area
+                    target = screen
+                }
+            }
+        }
+        let safe = target.visibleFrame.insetBy(dx: 12, dy: 12)
+        let maximumX = max(safe.minX, safe.maxX - panel.frame.width)
+        let maximumY = max(safe.minY, safe.maxY - panel.frame.height)
+        panel.setFrameOrigin(
+            NSPoint(
+                x: min(maximumX, max(safe.minX, panel.frame.minX)),
+                y: min(maximumY, max(safe.minY, panel.frame.minY))
+            ))
     }
 
     /// 业务作用: 将菜单栏左键作为录制入口或停止入口，右键提供明确退出。
@@ -307,8 +380,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     /// 业务作用: 从应用或菜单栏恢复工具栏，空闲不查询画面。
     /// 参数说明: 无。
-    /// 返回: 窗口出现在鼠标所在屏幕的底部安全区域。
+    /// 返回: 窗口恢复到用户保存的可见位置，首次启动位于当前屏幕底部中央。
     @objc private func showToolbar() {
+        ensureToolbarVisible()
         if engine.state.isBusy {
             caption.stringValue = engine.state == .stopping ? "正在完成保存与释放…" : "当前录制会话 · 点击停止"
             recordButton.title = "停止"
@@ -316,17 +390,6 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             panel.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
-        }
-        let screen =
-            NSScreen.screens.first {
-                $0.frame.contains(NSEvent.mouseLocation)
-            } ?? NSScreen.screens[0]
-        if panel.screen == nil || !screen.visibleFrame.intersects(panel.frame) {
-            panel.setFrameOrigin(
-                NSPoint(
-                    x: screen.visibleFrame.midX - 248,
-                    y: screen.visibleFrame.minY + 40
-                ))
         }
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -341,6 +404,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 参数说明: 无。
     /// 返回: 迟到来源结果不能重新显示选择层。
     @objc private func closeToolbar() {
+        panel.saveFrame(usingName: toolbarFrameName)
         sourceRequest = nil
         selection.hide()
         if engine.state.isBusy && engine.state != .recording && engine.state != .stopping {
@@ -721,6 +785,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// - sender: 请求退出的应用。
     /// 返回: 无写入时退出，否则等完成回调再答复系统。
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        panel.saveFrame(usingName: toolbarFrameName)
         if engine.canTerminate
             && !artifacts.contains(where: {
                 $0.hasWork

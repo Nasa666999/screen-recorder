@@ -60,7 +60,7 @@ final class SelectionController {
             panel.isOpaque = false
             panel.backgroundColor = .clear
             panel.level = .floating
-            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.collectionBehavior = [.fullScreenAuxiliary]
             panel.acceptsMouseMovedEvents = true
             let view = SelectionView(
                 frame: NSRect(
