@@ -281,14 +281,7 @@ final class CaptureEngine {
                 throw RecorderError.message("显示器布局已变化，选区不再有效，请重新框选。")
             }
             let scale = CGFloat(videoFilter.pointPixelScale)
-            let left = ceil(region.minX * scale) / scale
-            let top = ceil(region.minY * scale) / scale
-            let aligned = CGRect(
-                x: left,
-                y: top,
-                width: floor(region.maxX * scale) / scale - left,
-                height: floor(region.maxY * scale) / scale - top
-            )
+            let aligned = CaptureGeometry.alignedSourceRect(region, scale: scale)
             configuration.sourceRect = aligned
             rect = aligned
         }

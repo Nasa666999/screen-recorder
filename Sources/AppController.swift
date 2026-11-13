@@ -6,6 +6,8 @@ import ScreenCaptureKit
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let engine = CaptureEngine()
     private let selection = SelectionController()
+    private let recordingIndicator = RecordingStatusIndicator()
+    private let recordingBorder = RecordingBorderController()
     private let hotKeys = HotKeys()
     private var options = RecorderOptions.load()
     private var statusItem: NSStatusItem!
@@ -527,6 +529,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         sourceRequest = nil
         selection.hide()
+        // 提示边框在选择层撤下时接续显示，采集过滤始终排除本应用窗口，边框不写入成品。
+        recordingBorder.show(for: selected)
         panel.orderOut(nil)
         engine.start(selection: selected, options: options)
     }
@@ -537,12 +541,15 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// 返回: 只有忙碌阶段持有停止热键。
     private func update(_ state: RecordingState) {
         stopAvailable = hotKeys.setStopEnabled(state.isBusy)
-        statusItem.button?.image = NSImage(
-            systemSymbolName: state.isBusy ? "stop.circle.fill" : "record.circle",
-            accessibilityDescription: state.isBusy ? "停止录制" : "Screen Recorder"
-        )
-        statusItem.button?.toolTip =
-            state.isBusy ? (stopAvailable ? "停止录制（⌃⌘Esc）" : "停止快捷键被占用，请点击此处停止") : "显示录制工具"
+        recordingIndicator.update(state, button: statusItem.button, stopAvailable: stopAvailable)
+        switch state {
+        case .recording:
+            recordingBorder.setRecording(true)
+        case .idle, .selecting, .stopping, .needsAttention:
+            recordingBorder.hide()
+        case .preparing, .countingDown, .starting:
+            recordingBorder.setRecording(false)
+        }
         modes.isEnabled = !state.isBusy
         switch state {
         case .countingDown(let seconds):
@@ -883,6 +890,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showToolbar()
         return true
+    }
+
+    /// 业务作用: 退出时释放本应用的提示窗口、选择图像和菜单栏动画。
+    /// 参数说明:
+    /// - notification: 系统即将终止应用的通知。
+    /// 返回: 不留下需要用户手动清理的录制提示。
+    func applicationWillTerminate(_ notification: Notification) {
+        selection.hide()
+        recordingBorder.hide()
+        recordingIndicator.stop()
     }
 
     /// 业务作用: 用户主动退出时交给统一的应用终止流程。

@@ -41,6 +41,9 @@ final class SelectionController {
         }.sorted {
             (ranks[$0.windowID] ?? Int.max) < (ranks[$1.windowID] ?? Int.max)
         }
+        let applications = content.applications.filter {
+            $0.processID == ProcessInfo.processInfo.processIdentifier
+        }
         for screen in NSScreen.screens {
             guard
                 let number = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")]
@@ -71,6 +74,11 @@ final class SelectionController {
             view.windows = windows
             view.screenFrame = screen.frame
             view.primaryHeight = primaryHeight
+            view.pixelScale = CGFloat(
+                SCContentFilter(
+                    display: display,
+                    excludingWindows: []
+                ).pointPixelScale)
             view.onCancel = { [weak self] in
                 self?.onCancel?()
             }
@@ -88,6 +96,7 @@ final class SelectionController {
             if mode == .region, options.rememberSelection, options.savedDisplayID == display.displayID,
                 let region = options.savedRegion
             {
+                let region = CaptureGeometry.alignedSourceRect(region, scale: view.pixelScale)
                 let local = NSRect(
                     x: region.minX,
                     y: screen.frame.height - region.maxY,
@@ -105,6 +114,13 @@ final class SelectionController {
                 }
             }
             panel.contentView = view
+            if mode == .region {
+                view.setAccessibilityElement(true)
+                view.setAccessibilityRole(.group)
+                view.setAccessibilityLabel("录制区域选择")
+                view.setAccessibilityHelp("拖动选择区域；方向键移动一个像素，Shift 移动十个像素，Option 调整边缘。")
+                view.startMagnifier(display: display, applications: applications)
+            }
             panel.orderFrontRegardless()
             panels.append(panel)
         }
@@ -115,6 +131,7 @@ final class SelectionController {
     /// 返回: 当前选择层全部退出显示。
     func hide() {
         for panel in panels {
+            (panel.contentView as? SelectionView)?.stopMagnifier()
             panel.orderOut(nil)
         }
         panels.removeAll()
@@ -127,6 +144,7 @@ private final class SelectionView: NSView {
     var windows: [SCWindow] = []
     var screenFrame = NSRect.zero
     var primaryHeight: CGFloat = 0
+    var pixelScale: CGFloat = 1
     var region: NSRect?
     var onChange: ((CGRect?, SCWindow?, Bool) -> Void)?
     var onCancel: (() -> Void)?
@@ -135,6 +153,10 @@ private final class SelectionView: NSView {
     private var origin = NSPoint.zero
     private var original = NSRect.zero
     private var handle = -1
+    private let magnifier = PixelMagnifier()
+    private var pointer: NSPoint?
+    private var magnifierSample: MagnifierSample?
+    private var magnifierUnavailable = false
 
     override var acceptsFirstResponder: Bool {
         true
@@ -151,9 +173,55 @@ private final class SelectionView: NSView {
         addTrackingArea(
             NSTrackingArea(
                 rect: bounds,
-                options: [.activeAlways, .mouseMoved, .inVisibleRect],
+                options: [.activeAlways, .mouseMoved, .mouseEnteredAndExited, .inVisibleRect],
                 owner: self
             ))
+    }
+
+    /// 业务作用: 区域选择使用十字光标提示像素定位，不改变系统光标大小设置。
+    /// 参数说明: 无。
+    /// 返回: 光标只在本选择视图内改变。
+    override func resetCursorRects() {
+        super.resetCursorRects()
+        if mode == .region {
+            addCursorRect(bounds, cursor: .crosshair)
+        }
+    }
+
+    /// 业务作用: 建立仅服务本轮选区的像素放大镜，并与选择层一同释放。
+    /// 参数说明:
+    /// - display: 当前选择层对应的显示器。
+    /// - applications: 应从像素图排除的本应用身份。
+    /// 返回: 小范围像素异步进入当前视图，不缓存完整桌面画面。
+    func startMagnifier(display: SCDisplay, applications: [SCRunningApplication]) {
+        magnifier.start(
+            display: display, applications: applications, bounds: bounds,
+            point: { [weak self] in
+                self?.pointer
+            },
+            receive: { [weak self] result in
+                guard let self else {
+                    return
+                }
+                switch result {
+                case .success(let sample):
+                    self.magnifierSample = sample
+                    self.magnifierUnavailable = false
+                case .failure:
+                    self.magnifierSample = nil
+                    self.magnifierUnavailable = true
+                }
+                self.needsDisplay = true
+            })
+    }
+
+    /// 业务作用: 关闭选区时清除像素数据和截图任务，不把放大镜带入录制状态。
+    /// 参数说明: 无。
+    /// 返回: 当前视图不再读取或持有屏幕像素。
+    func stopMagnifier() {
+        magnifier.stop()
+        magnifierSample = nil
+        pointer = nil
     }
 
     /// 业务作用: 绘制来源遮罩与区域控制点，明确实际录制边界。
@@ -191,7 +259,9 @@ private final class SelectionView: NSView {
                         )
                     ).fill()
                 }
-                let text = "\(Int(selected.width)) × \(Int(selected.height))" as NSString
+                let text =
+                    "\(Int((selected.width * pixelScale).rounded())) × \(Int((selected.height * pixelScale).rounded())) px"
+                    as NSString
                 text.draw(
                     at: NSPoint(
                         x: selected.minX + 8,
@@ -203,6 +273,120 @@ private final class SelectionView: NSView {
                     ])
             }
         }
+        if mode == .region, let pointer {
+            drawMagnifier(at: pointer)
+        }
+    }
+
+    /// 业务作用: 逐像素放大控制点附近的真实画面，并标明实际像素坐标和采样状态。
+    /// 参数说明:
+    /// - point: 已对齐物理像素的当前控制点。
+    /// 返回: 放大镜避开屏幕边缘，无匹配采样时显示等待而不使用旧位置画面。
+    private func drawMagnifier(at point: NSPoint) {
+        let zoom: CGFloat = 7
+        let side: CGFloat = 21 * zoom
+        let size = NSSize(
+            width: side + 20,
+            height: side + 58
+        )
+        let x = point.x + size.width + 26 < bounds.maxX ? point.x + 26 : point.x - size.width - 26
+        let y = point.y + size.height + 26 < bounds.maxY ? point.y + 26 : point.y - size.height - 26
+        let frame = NSRect(
+            x: min(max(8, x), max(8, bounds.width - size.width - 8)),
+            y: min(max(8, y), max(8, bounds.height - size.height - 8)),
+            width: size.width,
+            height: size.height
+        )
+        NSColor.black.withAlphaComponent(0.92).setFill()
+        NSBezierPath(
+            roundedRect: frame,
+            xRadius: 10,
+            yRadius: 10
+        ).fill()
+        NSColor.white.withAlphaComponent(0.8).setStroke()
+        NSBezierPath(
+            roundedRect: frame.insetBy(dx: 0.5, dy: 0.5),
+            xRadius: 10,
+            yRadius: 10
+        ).stroke()
+        let imageRect = NSRect(
+            x: frame.minX + 10,
+            y: frame.maxY - side - 10,
+            width: side,
+            height: side
+        )
+        if let sample = magnifierSample, sample.point == point {
+            NSGraphicsContext.saveGraphicsState()
+            NSGraphicsContext.current?.imageInterpolation = .none
+            NSImage(
+                cgImage: sample.image,
+                size: NSSize(
+                    width: 21,
+                    height: 21
+                )
+            ).draw(in: imageRect)
+            NSGraphicsContext.restoreGraphicsState()
+            let grid = NSBezierPath()
+            for index in 0...21 {
+                let offset = CGFloat(index) * zoom
+                grid.move(
+                    to: NSPoint(
+                        x: imageRect.minX + offset,
+                        y: imageRect.minY
+                    ))
+                grid.line(
+                    to: NSPoint(
+                        x: imageRect.minX + offset,
+                        y: imageRect.maxY
+                    ))
+                grid.move(
+                    to: NSPoint(
+                        x: imageRect.minX,
+                        y: imageRect.minY + offset
+                    ))
+                grid.line(
+                    to: NSPoint(
+                        x: imageRect.maxX,
+                        y: imageRect.minY + offset
+                    ))
+            }
+            NSColor.white.withAlphaComponent(0.25).setStroke()
+            grid.lineWidth = 0.5
+            grid.stroke()
+            let reticle = NSRect(
+                x: imageRect.minX + CGFloat(sample.pixelX - sample.cropX) * zoom,
+                y: imageRect.maxY - CGFloat(sample.pixelY - sample.cropY + 1) * zoom,
+                width: zoom,
+                height: zoom
+            )
+            let crosshair = NSBezierPath(rect: reticle)
+            NSColor.black.setStroke()
+            crosshair.lineWidth = 3
+            crosshair.stroke()
+            NSColor.systemRed.setStroke()
+            crosshair.lineWidth = 1.5
+            crosshair.stroke()
+        } else {
+            let text = magnifierUnavailable ? "放大镜暂不可用" : "正在读取像素…"
+            (text as NSString).draw(
+                at: NSPoint(
+                    x: imageRect.minX + 15,
+                    y: imageRect.midY - 6
+                ),
+                withAttributes: [.font: NSFont.systemFont(ofSize: 12), .foregroundColor: NSColor.white])
+        }
+        let xPixel = Int((point.x * pixelScale).rounded())
+        let yPixel = Int(((bounds.height - point.y) * pixelScale).rounded())
+        let label = "X \(xPixel)   Y \(yPixel) px\n方向键 1px · ⇧ 10px"
+        (label as NSString).draw(
+            at: NSPoint(
+                x: frame.minX + 10,
+                y: frame.minY + 7
+            ),
+            withAttributes: [
+                .font: NSFont.monospacedDigitSystemFont(ofSize: 10, weight: .medium),
+                .foregroundColor: NSColor.white,
+            ])
     }
 
     /// 业务作用: 将系统顶部原点的窗口边界转换为当前屏幕的 Cocoa 局部坐标。
@@ -264,13 +448,23 @@ private final class SelectionView: NSView {
     /// - event: 当前选择层的鼠标移动。
     /// 返回: 窗口选择不切换或激活目标应用。
     override func mouseMoved(with event: NSEvent) {
-        guard mode == .window else {
-            return
-        }
         let point = convert(event.locationInWindow, from: nil)
-        highlighted = windows.first {
-            localRect($0.frame).contains(point)
+        if mode == .region {
+            pointer = CaptureGeometry.snappedPoint(point, in: bounds, scale: pixelScale)
+        } else if mode == .window {
+            highlighted = windows.first {
+                localRect($0.frame).contains(point)
+            }
         }
+        needsDisplay = true
+    }
+
+    /// 业务作用: 鼠标离开选择层后暂停像素读取，不在工具栏或其他显示器上留下放大镜。
+    /// 参数说明:
+    /// - event: 当前跟踪区域的离开事件。
+    /// 返回: 当前放大镜消失，重新进入后由鼠标位置恢复。
+    override func mouseExited(with event: NSEvent) {
+        pointer = nil
         needsDisplay = true
     }
 
@@ -280,7 +474,9 @@ private final class SelectionView: NSView {
     /// 返回: 屏幕和窗口模式提交开始，区域模式等待拖动完成。
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
-        origin = convert(event.locationInWindow, from: nil)
+        origin = CaptureGeometry.snappedPoint(
+            convert(event.locationInWindow, from: nil), in: bounds, scale: pixelScale)
+        pointer = origin
         if mode == .display {
             onChange?(nil, nil, true)
             return
@@ -308,6 +504,7 @@ private final class SelectionView: NSView {
                 size: .zero
             )
         }
+        needsDisplay = true
     }
 
     /// 业务作用: 调整同一显示器内的选区，禁止越界扩大录制范围。
@@ -319,10 +516,8 @@ private final class SelectionView: NSView {
             return
         }
         let raw = convert(event.locationInWindow, from: nil)
-        let point = NSPoint(
-            x: min(bounds.maxX, max(0, raw.x)),
-            y: min(bounds.maxY, max(0, raw.y))
-        )
+        let point = CaptureGeometry.snappedPoint(raw, in: bounds, scale: pixelScale)
+        pointer = point
         if handle == 8 {
             region = NSRect(
                 x: min(bounds.width - original.width, max(0, original.minX + point.x - origin.x)),
@@ -369,9 +564,19 @@ private final class SelectionView: NSView {
     /// - event: 用户结束调整事件。
     /// 返回: 合法区域可录制；过小区域仍保持不可开始。
     override func mouseUp(with event: NSEvent) {
+        publishRegion()
+    }
+
+    /// 业务作用: 发布合法的像素对齐选区，同时让辅助功能读出边界和实际像素尺寸。
+    /// 参数说明: 无。
+    /// 返回: 合法区域恢复录制入口；过小区域不会被当成有效来源。
+    private func publishRegion() {
         guard mode == .region, let region, region.width >= 8, region.height >= 8 else {
             return
         }
+        setAccessibilityValue(
+            "X \(Int((region.minX * pixelScale).rounded()))，Y \(Int(((bounds.height - region.maxY) * pixelScale).rounded()))，宽 \(Int((region.width * pixelScale).rounded())) 像素，高 \(Int((region.height * pixelScale).rounded())) 像素"
+        )
         onChange?(
             CGRect(
                 x: region.minX,
@@ -385,10 +590,24 @@ private final class SelectionView: NSView {
     /// 业务作用: 允许用户取消当前选择，不转发取消键到其他应用。
     /// 参数说明:
     /// - event: 当前选择界面的键盘事件。
-    /// 返回: Escape 关闭选择层，其他按键按系统处理。
+    /// 返回: Escape 关闭选择层；方向键按物理像素移动，Option 调整右侧及上侧边缘。
     override func keyDown(with event: NSEvent) {
         if event.keyCode == 53 {
             onCancel?()
+        } else if mode == .region, var region, [123, 124, 125, 126].contains(event.keyCode) {
+            let step: CGFloat = (event.modifierFlags.contains(.shift) ? 10 : 1) / pixelScale
+            let dx: CGFloat = event.keyCode == 123 ? -step : (event.keyCode == 124 ? step : 0)
+            let dy: CGFloat = event.keyCode == 125 ? -step : (event.keyCode == 126 ? step : 0)
+            if event.modifierFlags.contains(.option) {
+                region.size.width = max(8, min(bounds.maxX - region.minX, region.width + dx))
+                region.size.height = max(8, min(bounds.maxY - region.minY, region.height + dy))
+            } else {
+                region.origin.x = min(bounds.maxX - region.width, max(0, region.minX + dx))
+                region.origin.y = min(bounds.maxY - region.height, max(0, region.minY + dy))
+            }
+            self.region = region
+            publishRegion()
+            needsDisplay = true
         } else {
             super.keyDown(with: event)
         }
