@@ -189,7 +189,7 @@ final class CaptureEngine {
         }
     }
 
-    /// 业务作用: 根据有效来源建立最多两条流，窗口系统声音不收窄到所属应用。
+    /// 业务作用: 根据有效来源建立最多两条流，画面范围和用户选择的声音范围分别固定。
     /// 参数说明:
     /// - selection: 用户选择的来源身份与局部区域。
     /// - options: 冻结后的设置。
@@ -229,6 +229,38 @@ final class CaptureEngine {
         } else {
             videoFilter = displayFilter
         }
+        var audioFilter = displayFilter
+        var selectedAudioPIDs: [pid_t] = []
+        if options.systemAudio, let requested = options.audioApplicationBundleIDs {
+            let identifiers = Set(requested)
+            // 空的应用范围没有采音授权含义，必须要求用户选择，不能按全系统声音解释。
+            guard !identifiers.isEmpty else {
+                throw RecorderError.message("请至少选择一个声音应用，或改用“全部系统声音”。")
+            }
+            let applications = content.applications.filter {
+                identifiers.contains($0.bundleIdentifier)
+                    && $0.processID != ProcessInfo.processInfo.processIdentifier
+            }
+            let resolved = Set(
+                applications.map {
+                    $0.bundleIdentifier
+                })
+            // 用户限定的声音范围不可扩大，缺席应用不能静默替换为全系统采音。
+            guard resolved == identifiers else {
+                throw RecorderError.message("所选声音应用当前不可采集，请重新选择声音应用或改用全部系统声音。")
+            }
+            audioFilter = SCContentFilter(
+                display: display,
+                including: applications,
+                exceptingWindows: []
+            )
+            selectedAudioPIDs = applications.map {
+                $0.processID
+            }
+        }
+        let needsAudioHelper =
+            options.systemAudio
+            && (selection.window != nil || options.audioApplicationBundleIDs != nil)
         if options.hdr && options.showMouseClicks {
             throw RecorderError.message("当前公开采集能力不能在 HDR 管线上显示鼠标点按，请明确关闭其中一项后重新开始。")
         }
@@ -284,7 +316,7 @@ final class CaptureEngine {
         configuration.scalesToFit = true
         configuration.preservesAspectRatio = true
         configuration.showMouseClicks = options.showMouseClicks
-        configuration.capturesAudio = options.systemAudio && selection.window == nil
+        configuration.capturesAudio = options.systemAudio && !needsAudioHelper
         configuration.excludesCurrentProcessAudio = true
         configuration.sampleRate = 48_000
         configuration.channelCount = 2
@@ -308,7 +340,7 @@ final class CaptureEngine {
             filter: videoFilter, configuration: configuration, screen: true,
             audio: configuration.capturesAudio, microphone: configuration.captureMicrophone,
             session: session)
-        if selection.window != nil, options.systemAudio {
+        if needsAudioHelper {
             let audioConfiguration = SCStreamConfiguration()
             audioConfiguration.width = 2
             audioConfiguration.height = 2
@@ -323,7 +355,7 @@ final class CaptureEngine {
             audioConfiguration.channelCount = 2
             audioConfiguration.captureMicrophone = false
             try addStream(
-                filter: displayFilter, configuration: audioConfiguration, screen: false, audio: true,
+                filter: audioFilter, configuration: audioConfiguration, screen: false, audio: true,
                 microphone: false, session: session)
         }
         self.session = session
@@ -386,8 +418,8 @@ final class CaptureEngine {
             self.stop(reason: "五秒内未完成采集启动与有效首帧写入。")
         }
         let watchedDisplayID = display.displayID
-        let watchedWindowID = selection.window?.windowID
         let watchedPID = selection.window?.owningApplication?.processID
+        let watchedAudioPIDs = selectedAudioPIDs
         session.monitor = Timer.scheduledTimer(withTimeInterval: 2, repeats: true) {
             [weak self, weak session] _ in
             Task { @MainActor in
@@ -399,22 +431,16 @@ final class CaptureEngine {
                     self.stop(reason: "来源显示器已断开。")
                     return
                 }
-                if let watchedWindowID {
-                    let info =
-                        CGWindowListCopyWindowInfo(
-                            .optionIncludingWindow,
-                            watchedWindowID
-                        )
-                        as? [[String: Any]]
-                    let exists =
-                        info?.contains(where: {
-                            ($0[kCGWindowNumber as String] as? UInt32) == watchedWindowID
-                                && ($0[kCGWindowOwnerPID as String] as? Int32)
-                                    == watchedPID
-                        }) == true
-                    if !exists {
-                        self.stop(reason: "原始窗口已关闭或无法复验其身份。")
-                    }
+                if watchedAudioPIDs.contains(where: {
+                    NSRunningApplication(processIdentifier: $0)?.isTerminated != false
+                }) {
+                    self.stop(reason: "所选声音应用已退出，请重新选择后开始新的录制。")
+                    return
+                }
+                // 非活动 Space 的窗口不必出现在当前桌面的窗口列表中，终止依据来自原采集流和进程生命周期。
+                if let watchedPID, NSRunningApplication(processIdentifier: watchedPID)?.isTerminated != false
+                {
+                    self.stop(reason: "原窗口所属应用已退出。")
                 }
             }
         }

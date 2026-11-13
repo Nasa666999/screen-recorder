@@ -89,7 +89,15 @@ final class MediaPipeline: @unchecked Sendable {
                     )
                     as? [[SCStreamFrameInfo: Any]]
                 guard let raw = attachments?.first?[.status] as? Int,
-                    SCFrameStatus(rawValue: raw) == .complete,
+                    let status = SCFrameStatus(rawValue: raw)
+                else {
+                    return
+                }
+                // 来源明确停止时结束录制；用户正常停止产生的末尾通知不能再变成采集失败。
+                if status == .stopped, stopBoundary == nil {
+                    throw RecorderError.message("原画面来源已停止采集。")
+                }
+                guard status == .complete,
                     sample.imageBuffer != nil, ready
                 else {
                     return

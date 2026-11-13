@@ -10,6 +10,7 @@ build: Resources/AppIcon.icns
 	cp Resources/Info.plist "$(APP)/Contents/Info.plist"
 	cp Resources/AppIcon.icns "$(APP)/Contents/Resources/AppIcon.icns"
 	codesign --force --sign "$(SIGN_IDENTITY)" --identifier com.nasa666999.screen-recorder "$(APP)"
+	touch "$(APP)"
 
 icon: Resources/AppIcon.icns
 

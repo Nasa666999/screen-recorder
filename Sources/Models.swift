@@ -7,6 +7,15 @@ enum CaptureMode: String, Codable, CaseIterable {
     case window
     case region
 
+    var spaceHint: String {
+        switch self {
+        case .window:
+            return "切换桌面后仍录原窗口"
+        case .display, .region:
+            return "随桌面切换；跨桌面固定录制请选窗口"
+        }
+    }
+
     var title: String {
         switch self {
         case .display:
@@ -46,6 +55,7 @@ struct RecorderOptions: Codable {
     }
     var mode = CaptureMode.display
     var systemAudio = true
+    var audioApplicationBundleIDs: [String]?
     var microphoneID: String?
     var quality = Quality.automatic
     var frameRate = 0
@@ -58,6 +68,16 @@ struct RecorderOptions: Codable {
     var directoryBookmark: Data?
     var savedDisplayID: UInt32?
     var savedRegion: CGRect?
+
+    var systemAudioSummary: String {
+        if !systemAudio {
+            return "关闭"
+        }
+        if let applications = audioApplicationBundleIDs {
+            return "仅所选应用（\(applications.count) 个，所有桌面）"
+        }
+        return "全部系统声音（所有桌面）"
+    }
 
     /// 业务作用: 恢复用户主动选择的录制选项，损坏配置回到安全默认值。
     /// 参数说明: 无。

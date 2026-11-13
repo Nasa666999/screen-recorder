@@ -36,7 +36,7 @@ final class SelectionController {
                 ($1, $0)
             })
         let windows = content.windows.filter {
-            $0.windowLayer == 0 && $0.frame.width > 8 && $0.frame.height > 8
+            $0.isOnScreen && $0.windowLayer == 0 && $0.frame.width > 8 && $0.frame.height > 8
                 && $0.owningApplication?.processID != ProcessInfo.processInfo.processIdentifier
         }.sorted {
             (ranks[$0.windowID] ?? Int.max) < (ranks[$1.windowID] ?? Int.max)

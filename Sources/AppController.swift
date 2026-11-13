@@ -15,6 +15,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var recordButton: NSButton!
     private var caption: NSTextField!
     private var selected: CaptureSelection?
+    private var availableSources: SCShareableContent?
     private var sourceRequest: UUID?
     private var artifacts: [ArtifactController] = []
     private var observers: [NSObjectProtocol] = []
@@ -122,6 +123,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     }
                     // 切换桌面撤销尚未完成的选择，迟到查询不能在新桌面铺开遮罩；已经开始的录制保留。
                     self.sourceRequest = nil
+                    self.availableSources = nil
                     self.selection.hide()
                     if !self.engine.state.isBusy {
                         self.panel.orderOut(nil)
@@ -236,7 +238,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         modes.selectedSegment = CaptureMode.allCases.firstIndex(of: options.mode) ?? 0
         for index in 0..<3 {
             modes.setWidth(58, forSegment: index)
-            modes.setToolTip(CaptureMode.allCases[index].title, forSegment: index)
+            modes.setToolTip(
+                CaptureMode.allCases[index].title + "：" + CaptureMode.allCases[index].spaceHint,
+                forSegment: index)
         }
         effect.addSubview(modes)
         let optionsButton = NSPopUpButton(
@@ -394,10 +398,12 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         caption.stringValue = selected?.summary ?? options.mode.title
+        caption.stringValue += " · " + options.mode.spaceHint
         recordButton.isEnabled = options.mode == .display || selected != nil
         if !invocationAvailable {
             caption.stringValue += " · ⌘⇧5 被占用，可用菜单栏打开"
         }
+        caption.toolTip = caption.stringValue
     }
 
     /// 业务作用: 关闭本次选择并撤销异步来源查询，不退出应用。
@@ -406,6 +412,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc private func closeToolbar() {
         panel.saveFrame(usingName: toolbarFrameName)
         sourceRequest = nil
+        availableSources = nil
         selection.hide()
         if engine.state.isBusy && engine.state != .recording && engine.state != .stopping {
             engine.stop()
@@ -423,6 +430,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         options.mode = CaptureMode.allCases[modes.selectedSegment]
         options.save()
         selected = nil
+        availableSources = nil
         chooseSource(startDisplayImmediately: false)
     }
 
@@ -441,6 +449,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 guard sourceRequest == request, !engine.state.isBusy else {
                     return
                 }
+                availableSources = content
                 if options.mode == .display, startDisplayImmediately {
                     let screen = panel.screen ?? NSScreen.main!
                     let id =
@@ -470,6 +479,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     return
                 }
                 selection.hide()
+                availableSources = nil
                 recordButton.isEnabled = true
                 caption.stringValue = "请检查权限后重新选择"
                 issue(RecorderError.describe(error))
@@ -508,7 +518,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 }?.localizedName
                 ?? "无"
             alert.informativeText =
-                "\(selected.summary)\n画质：\(options.quality.title)，帧率：\(options.frameRate == 0 ? "自动" : String(options.frameRate))\n系统声音：\(options.systemAudio ? "开启，包含其他应用声音" : "关闭")\n麦克风：\(microphone)"
+                "\(selected.summary)\n\(options.mode.spaceHint)\n画质：\(options.quality.title)，帧率：\(options.frameRate == 0 ? "自动" : String(options.frameRate))\n系统声音：\(options.systemAudioSummary)\n麦克风：\(microphone)"
             alert.addButton(withTitle: "开始")
             alert.addButton(withTitle: "返回")
             guard alert.runModal() == .alertFirstButtonReturn else {
@@ -583,7 +593,20 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
         menu.addItem(withTitle: "选项", action: nil, keyEquivalent: "")
-        addOption("系统声音（包含其他应用）", value: "systemAudio", checked: options.systemAudio, to: menu)
+        if options.mode == .window, let content = availableSources {
+            let windows = submenu("选择录制窗口", in: menu)
+            for window in content.windows
+            where window.isOnScreen && window.windowLayer == 0
+                && window.frame.width > 8 && window.frame.height > 8
+                && window.owningApplication?.processID != ProcessInfo.processInfo.processIdentifier
+            {
+                let application = window.owningApplication?.applicationName ?? "应用"
+                addOption(
+                    application + " · " + (window.title ?? "未命名窗口"), value: "window:\(window.windowID)",
+                    checked: selected?.window?.windowID == window.windowID, to: windows)
+            }
+        }
+        populateAudioMenu(in: menu)
         let microphone = submenu("麦克风", in: menu)
         addOption("无", value: "mic:", checked: options.microphoneID == nil, to: microphone)
         for device in RecorderOptions.microphones {
@@ -621,6 +644,56 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         addOption("显示鼠标点按", value: "clicks", checked: options.showMouseClicks, to: menu)
         menu.addItem(.separator())
         addOption("恢复默认设置", value: "reset", checked: false, to: menu)
+    }
+
+    /// 业务作用: 保留全系统声音默认值，同时让用户明确限定应用级音频范围。
+    /// 参数说明:
+    /// - menu: 录制选项所属菜单。
+    /// 返回: 可选择全部、指定应用或关闭，不改变麦克风及系统播放设备。
+    private func populateAudioMenu(in menu: NSMenu) {
+        let audio = submenu("系统声音", in: menu)
+        addOption(
+            "全部系统声音（所有桌面）", value: "audio:all",
+            checked: options.systemAudio && options.audioApplicationBundleIDs == nil, to: audio)
+        addOption(
+            "仅所选应用（所有桌面）", value: "audio:selected",
+            checked: options.systemAudio && options.audioApplicationBundleIDs != nil, to: audio)
+        addOption("关闭", value: "audio:off", checked: !options.systemAudio, to: audio)
+        let applications = submenu("选择应用（可多选）", in: audio)
+        var identifiers = Set(options.audioApplicationBundleIDs ?? [])
+        var names: [String: String] = [:]
+        for application in NSWorkspace.shared.runningApplications {
+            guard application.activationPolicy == .regular,
+                application.processIdentifier != ProcessInfo.processInfo.processIdentifier,
+                let identifier = application.bundleIdentifier
+            else {
+                continue
+            }
+            identifiers.insert(identifier)
+            names[identifier] = application.localizedName ?? identifier
+        }
+        for identifier in identifiers where names[identifier] == nil {
+            if let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: identifier) {
+                names[identifier] = url.deletingPathExtension().lastPathComponent + "（未运行）"
+            } else {
+                names[identifier] = identifier + "（未运行）"
+            }
+        }
+        for identifier in identifiers.sorted(by: {
+            (names[$0] ?? $0).localizedStandardCompare(names[$1] ?? $1) == .orderedAscending
+        }) {
+            addOption(
+                names[identifier] ?? identifier, value: "audio-app:" + identifier,
+                checked: options.audioApplicationBundleIDs?.contains(identifier) == true, to: applications)
+        }
+        audio.addItem(.separator())
+        let scope = NSMenuItem(
+            title: "应用过滤包含该应用在其它桌面的声音",
+            action: nil,
+            keyEquivalent: ""
+        )
+        scope.isEnabled = false
+        audio.addItem(scope)
     }
 
     /// 业务作用: 建立系统式分组选项，避免增加独立的必经配置页面。
@@ -668,8 +741,16 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return
         }
         switch value {
-        case "systemAudio":
-            options.systemAudio.toggle()
+        case "audio:all":
+            options.systemAudio = true
+            options.audioApplicationBundleIDs = nil
+        case "audio:selected":
+            options.systemAudio = true
+            if options.audioApplicationBundleIDs == nil {
+                options.audioApplicationBundleIDs = []
+            }
+        case "audio:off":
+            options.systemAudio = false
         case "confirm":
             options.confirmBeforeRecording.toggle()
         case "thumbnail":
@@ -716,7 +797,38 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             selection.hide()
             modes.selectedSegment = 0
         default:
-            if value.hasPrefix("mic:") {
+            if value.hasPrefix("window:") {
+                // 菜单快照只用于本轮选择；来源失效时要求重选，不能换用其他窗口或整个屏幕。
+                guard let identifier = UInt32(value.dropFirst("window:".count)),
+                    let content = availableSources,
+                    let window = content.windows.first(where: {
+                        $0.windowID == identifier
+                    }),
+                    let display = content.displays.first(where: {
+                        $0.frame.intersects(window.frame)
+                    })
+                else {
+                    issue("窗口来源已失效，请重新选择。")
+                    return
+                }
+                selected = CaptureSelection(
+                    display: display,
+                    window: window,
+                    region: nil
+                )
+                beginRecording()
+                return
+            } else if value.hasPrefix("audio-app:") {
+                let identifier = String(value.dropFirst("audio-app:".count))
+                var selected = Set(options.audioApplicationBundleIDs ?? [])
+                if selected.contains(identifier) {
+                    selected.remove(identifier)
+                } else {
+                    selected.insert(identifier)
+                }
+                options.audioApplicationBundleIDs = selected.sorted()
+                options.systemAudio = true
+            } else if value.hasPrefix("mic:") {
                 let id = String(value.dropFirst(4))
                 options.microphoneID = id.isEmpty ? nil : id
                 if let device = RecorderOptions.microphones.first(where: {
