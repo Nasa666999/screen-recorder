@@ -17,3 +17,4 @@ jobs:
         run: |
           codesign --verify --strict "build/Screen Recorder.app"
           plutil -lint "build/Screen Recorder.app/Contents/Info.plist"
+          test -s "build/Screen Recorder.app/Contents/Resources/AppIcon.icns"
