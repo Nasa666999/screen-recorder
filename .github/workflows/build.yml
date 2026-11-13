@@ -1,0 +1,19 @@
+name: 构建 macOS 应用
+on:
+  push:
+    branches: [main]
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - name: 构建独立应用
+        run: make build
+      - name: 检查应用签名与元数据
+        run: |
+          codesign --verify --strict "build/Screen Recorder.app"
+          plutil -lint "build/Screen Recorder.app/Contents/Info.plist"
