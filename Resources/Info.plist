@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key><string>com.nasa666999.screen-recorder</string>
+    <key>CFBundleName</key><string>Screen Recorder</string>
+    <key>CFBundleDisplayName</key><string>Screen Recorder</string>
+    <key>CFBundleExecutable</key><string>ScreenRecorder</string>
+    <key>CFBundlePackageType</key><string>APPL</string>
+    <key>CFBundleShortVersionString</key><string>0.1.0</string>
+    <key>CFBundleVersion</key><string>1</string>
+    <key>LSMinimumSystemVersion</key><string>26.0</string>
+    <key>LSUIElement</key><true/>
+    <key>NSHighResolutionCapable</key><true/>
+    <key>NSScreenCaptureUsageDescription</key><string>录制你主动选择的屏幕、窗口或区域，以及开启的系统声音。</string>
+    <key>NSMicrophoneUsageDescription</key><string>仅在你选择麦克风时，将旁白加入录制的视频。</string>
+    <key>NSAudioCaptureUsageDescription</key><string>将 Mac 正在播放的应用声音录入视频，不改变耳机连接或系统音量。</string>
+</dict>
+</plist>
