@@ -1,3 +1,4 @@
+import AVFoundation
 import AppKit
 import ScreenCaptureKit
 
@@ -36,6 +37,11 @@ enum Quality: String, Codable, CaseIterable {
 }
 
 struct RecorderOptions: Codable {
+  static var microphones: [AVCaptureDevice] {
+    AVCaptureDevice.DiscoverySession(
+      deviceTypes: [.microphone, .external], mediaType: .audio, position: .unspecified
+    ).devices
+  }
   var mode = CaptureMode.display
   var systemAudio = true
   var microphoneID: String?
