@@ -219,7 +219,7 @@ private final class RegionInteractionController {
             control?.orderOut(nil)
             return
         }
-        // 松开鼠标后不继续读取桌面像素；再次拖动边框时才恢复放大镜。
+        // 松开鼠标后不继续读取桌面像素；只有再次抓住控制点时才恢复放大镜。
         if !view.isDraggingRegion {
             view.stopMagnifier()
         }
@@ -387,6 +387,13 @@ private final class SelectionView: NSView {
     private var magnifierUnavailable = false
     private var magnifierSource: (SCDisplay, [SCRunningApplication])?
 
+    /// 业务作用: 将像素放大限定为由八个控制点之一取得的缩放手势，避免整体移动被误认为边界调整。
+    /// 参数说明: 无。
+    /// 返回: 控制点手势从按下到松开期间为真；首次绘制、整体移动和悬停均为假。
+    private var isResizingRegion: Bool {
+        mode == .region && isDraggingRegion && (0..<8).contains(handle)
+    }
+
     override var acceptsFirstResponder: Bool {
         true
     }
@@ -429,25 +436,28 @@ private final class SelectionView: NSView {
     /// 参数说明:
     /// - display: 当前选择层对应的显示器。
     /// - applications: 应从像素图排除的本应用身份。
-    /// 返回: 只保留来源元数据，实际拖动区域或边框时才开始取样。
+    /// 返回: 只保留来源元数据，按住八个控制点之一调整边界时才开始取样。
     func configureMagnifier(display: SCDisplay, applications: [SCRunningApplication]) {
         magnifierSource = (display, applications)
     }
 
-    /// 业务作用: 在用户明确开始拖动选区时开启附近像素取样，不把桌面自由操作当作采集请求。
+    /// 业务作用: 在用户抓住控制点调整边界时开启附近像素取样，整体移动或首次绘制不取得取样资格。
     /// 参数说明: 无。
-    /// 返回: 当前拖动期间可更新原始像素缓存，缺少本轮来源时不建立截图任务。
+    /// 返回: 当前控制点手势期间可更新原始像素缓存，未命中控制点或缺少来源时不建立截图任务。
     private func startMagnifier() {
-        guard let (display, applications) = magnifierSource else {
+        guard isResizingRegion, let (display, applications) = magnifierSource else {
             return
         }
         magnifier.start(
             display: display, applications: applications, bounds: bounds,
             point: { [weak self] in
-                self?.pointer
+                guard let self, self.isResizingRegion else {
+                    return nil
+                }
+                return self.pointer
             },
             receive: { [weak self] result in
-                guard let self else {
+                guard let self, self.isResizingRegion else {
                     return
                 }
                 switch result {
@@ -462,13 +472,15 @@ private final class SelectionView: NSView {
             })
     }
 
-    /// 业务作用: 关闭选区时清除像素数据和截图任务，不把放大镜带入录制状态。
+    /// 业务作用: 控制点手势结束或选择层关闭时清除像素数据和截图任务，不把放大镜带入普通交互或录制状态。
     /// 参数说明: 无。
     /// 返回: 当前视图不再读取或持有屏幕像素。
     func stopMagnifier() {
         magnifier.stop()
         magnifierSample = nil
+        magnifierUnavailable = false
         pointer = nil
+        needsDisplay = true
     }
 
     /// 业务作用: 用明暗双层轮廓绘制来源边界与区域控制点，使选区在不同桌面底色上保持可辨认。
@@ -520,7 +532,7 @@ private final class SelectionView: NSView {
                 drawRegionSize(for: selected)
             }
         }
-        if mode == .region, isDraggingRegion, let pointer {
+        if isResizingRegion, let pointer {
             drawMagnifier(at: pointer)
         }
     }
@@ -746,9 +758,12 @@ private final class SelectionView: NSView {
     override func mouseMoved(with event: NSEvent) {
         let point = convert(event.locationInWindow, from: nil)
         if mode == .region {
-            pointer = CaptureGeometry.snappedPoint(point, in: bounds, scale: pixelScale)
-            if let pointer {
+            if isResizingRegion {
+                let pointer = CaptureGeometry.snappedPoint(point, in: bounds, scale: pixelScale)
+                self.pointer = pointer
                 magnifier.update(at: pointer)
+            } else {
+                pointer = nil
             }
         } else if mode == .window {
             highlighted = windows.first {
@@ -758,10 +773,10 @@ private final class SelectionView: NSView {
         needsDisplay = true
     }
 
-    /// 业务作用: 鼠标进入选择层时立即显示其下的窗口或像素位置，不等待额外移动。
+    /// 业务作用: 鼠标进入选择层时立即更新窗口高亮或正在拖动的控制点位置，不将悬停当作像素取样请求。
     /// 参数说明:
     /// - event: 当前跟踪区域的进入事件。
-    /// 返回: 新显示的选择层具有与当前鼠标一致的高亮。
+    /// 返回: 窗口高亮及时更新，像素放大仍须由控制点手势取得资格。
     override func mouseEntered(with event: NSEvent) {
         mouseMoved(with: event)
     }
@@ -769,7 +784,7 @@ private final class SelectionView: NSView {
     /// 业务作用: 鼠标离开选择层后暂停像素读取，不在工具栏或其他显示器上留下放大镜。
     /// 参数说明:
     /// - event: 当前跟踪区域的离开事件。
-    /// 返回: 当前放大镜消失，重新进入后由鼠标位置恢复。
+    /// 返回: 当前放大镜消失，只有仍在进行的控制点手势可在重新进入后恢复。
     override func mouseExited(with event: NSEvent) {
         pointer = nil
         needsDisplay = true
@@ -802,18 +817,14 @@ private final class SelectionView: NSView {
     /// 参数说明:
     /// - point: 当前显示器局部坐标中的拖动起点。
     /// - existingOnly: 是否仅允许移动或调整既有区域。
-    /// 返回: 暂停录制入口；已选定区域只通过选区局部输入窗口接收本次拖动。
+    /// 返回: 暂停录制入口；只有控制点缩放显示像素放大，整体移动与首次绘制保留普通边框反馈。
     func beginRegionDrag(at point: NSPoint, existingOnly: Bool) {
         guard mode == .region, !existingOnly || region != nil else {
             return
         }
-        startMagnifier()
+        stopMagnifier()
         origin = CaptureGeometry.snappedPoint(point, in: bounds, scale: pixelScale)
-        pointer = origin
-        magnifier.update(at: origin)
         original = region ?? .zero
-        isDraggingRegion = true
-        onInvalidate?()
         handle = -1
         if let region {
             handle =
@@ -821,6 +832,14 @@ private final class SelectionView: NSView {
                     hypot($0.x - origin.x, $0.y - origin.y) <= 12
                 }
                 ?? (existingOnly || region.contains(origin) ? 8 : -1)
+        }
+        isDraggingRegion = true
+        onInvalidate?()
+        // 手势角色在按下时确定；整体移动经过控制点附近时也不能转成像素放大反馈。
+        if isResizingRegion {
+            pointer = origin
+            startMagnifier()
+            magnifier.update(at: origin)
         }
         if handle == -1 {
             region = NSRect(
@@ -843,14 +862,16 @@ private final class SelectionView: NSView {
     /// 业务作用: 根据当前显示器中的鼠标位置移动或缩放原区域，不将拖动交给桌面应用。
     /// 参数说明:
     /// - point: 由当前输入窗口换算得到的显示器局部位置。
-    /// 返回: 更新可见选区和局部输入位置，尚未完成的区域不会用于录制。
+    /// 返回: 更新可见选区和局部输入位置，只有已抓住控制点的手势更新像素放大。
     func dragRegion(to point: NSPoint) {
         guard mode == .region, isDraggingRegion else {
             return
         }
         let point = CaptureGeometry.snappedPoint(point, in: bounds, scale: pixelScale)
-        pointer = point
-        magnifier.update(at: point)
+        if isResizingRegion {
+            pointer = point
+            magnifier.update(at: point)
+        }
         if handle == 8 {
             region = NSRect(
                 x: min(bounds.width - original.width, max(0, original.minX + point.x - origin.x)),
@@ -903,12 +924,14 @@ private final class SelectionView: NSView {
 
     /// 业务作用: 结束当前拖动并将全屏选择层改为鼠标穿透，后续保留框内拖动和控制点调整。
     /// 参数说明: 无。
-    /// 返回: 有效选区发布后可正常操作框外桌面；调整退化为无效尺寸时保留原有效区域。
+    /// 返回: 松开后立即停止像素取样；有效选区发布后可正常操作框外桌面，无效尺寸恢复原区域。
     func finishRegionDrag() {
         guard mode == .region, isDraggingRegion else {
             return
         }
         isDraggingRegion = false
+        handle = -1
+        stopMagnifier()
         if let region, region.width >= 8, region.height >= 8 {
             isRegionCommitted = true
         } else if isRegionCommitted {
