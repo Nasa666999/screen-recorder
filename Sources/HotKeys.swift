@@ -102,7 +102,7 @@ final class HotKeys {
         ) == noErr
     }
 
-    /// 业务作用: 仅在录制相关阶段持有停止快捷键，空闲时归还系统。
+    /// 业务作用: 仅在录制相关阶段持有 Control + Esc 停止快捷键，空闲时归还系统。
     /// 参数说明:
     /// - enabled: 是否需要停止本应用的会话。
     /// 返回: 启用失败时返回假，菜单栏停止入口保持可用。
@@ -117,13 +117,13 @@ final class HotKeys {
         if stop != nil {
             return true
         }
-        guard !systemShortcutEnabled(keyCode: UInt32(kVK_Escape), modifiers: UInt32(cmdKey | controlKey))
+        guard !systemShortcutEnabled(keyCode: UInt32(kVK_Escape), modifiers: UInt32(controlKey))
         else {
             return false
         }
         return RegisterEventHotKey(
             UInt32(kVK_Escape),
-            UInt32(cmdKey | controlKey),
+            UInt32(controlKey),
             EventHotKeyID(
                 signature: 0x5352_4352,
                 id: 2

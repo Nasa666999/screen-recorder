@@ -63,13 +63,9 @@ final class RecordingLocation {
     /// 参数说明: 无。
     /// 返回: 已发布文件的位置；失败保留未完成位置供用户处理。
     func publish() throws -> URL {
-        let formatter = DateFormatter()
-        formatter.locale = .current
-        formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
-        let base = "Screen Recording \(formatter.string(from: Date()))"
+        let date = Date()
         for index in 0..<10_000 {
-            let suffix = index == 0 ? "" : " \(index)"
-            let destination = directory.appendingPathComponent("\(base)\(suffix).mov")
+            let destination = directory.appendingPathComponent(Self.fileName(at: date, suffix: index))
             // 独占重命名关闭检查与发布之间的竞争窗口，已有文件始终保留。
             if renamex_np(temporaryURL.path, destination.path, UInt32(RENAME_EXCL)) == 0 {
                 return destination
@@ -79,6 +75,34 @@ final class RecordingLocation {
             }
         }
         throw RecorderError.message("同名文件过多，视频保留在所选目录的未完成位置。")
+    }
+
+    /// 业务作用: 为录制与剪辑成品提供一致的日期时间命名规则。
+    /// 参数说明:
+    /// - date: 本次保存的本地日期时间。
+    /// - suffix: 同一秒发生重名时追加的序号，零表示不追加。
+    /// 返回: 包含 MOV 扩展名的建议名称，不创建文件。
+    static func fileName(at date: Date, suffix: Int = 0) -> String {
+        let formatter = DateFormatter()
+        formatter.locale = .current
+        formatter.dateFormat = "yyyy-MM-dd 'at' HH.mm.ss"
+        let suffix = suffix == 0 ? "" : " \(suffix)"
+        return "\(formatter.string(from: date))\(suffix).mov"
+    }
+
+    /// 业务作用: 为剪辑保存面板选择未占用的录屏式名称，避免默认名称指向已有成品。
+    /// 参数说明:
+    /// - directory: 用户当前选择的输出目录。
+    /// 返回: 当前未占用的建议名称；最终发布仍需独占创建，不能依赖此处预检查覆盖文件。
+    static func suggestedFileName(in directory: URL) throws -> String {
+        let date = Date()
+        for suffix in 0..<10_000 {
+            let name = fileName(at: date, suffix: suffix)
+            if !FileManager.default.fileExists(atPath: directory.appendingPathComponent(name).path) {
+                return name
+            }
+        }
+        throw RecorderError.message("同一时间的文件名已被占用，请选择其他保存位置或名称。")
     }
 
     /// 业务作用: 只移除从未写入有效媒体的本次空产物。

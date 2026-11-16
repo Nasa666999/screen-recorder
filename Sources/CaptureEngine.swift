@@ -14,7 +14,7 @@ private final class StreamBridge: NSObject, SCStreamOutput, SCStreamDelegate {
         self.media = media
     }
 
-    /// 业务作用: 直接在注册的媒体队列交付采集样本，不二次积压回调。
+    /// 业务作用: 在实时采集队列只提交有界样本，不等待混音、编码或磁盘写入。
     /// 参数说明:
     /// - stream: 样本所属的采集流。
     /// - sampleBuffer: 当前媒体数据。
@@ -24,7 +24,7 @@ private final class StreamBridge: NSObject, SCStreamOutput, SCStreamDelegate {
         _ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
         of type: SCStreamOutputType
     ) {
-        media.consume(sampleBuffer, type: type)
+        media.enqueue(sampleBuffer, type: type)
     }
 
     /// 业务作用: 将系统终止采集通知交回控制层，由其统一结束其他流。
@@ -216,6 +216,7 @@ final class CaptureEngine {
             exceptingWindows: []
         )
         let videoFilter: SCContentFilter
+        var selectedWindowFrame: CGRect?
         if let oldWindow = selection.window {
             guard
                 let window = content.windows.first(where: {
@@ -226,6 +227,7 @@ final class CaptureEngine {
                 throw RecorderError.message("所选窗口已失效，请重新选择。")
             }
             videoFilter = SCContentFilter(desktopIndependentWindow: window)
+            selectedWindowFrame = window.frame
         } else {
             videoFilter = displayFilter
         }
@@ -272,6 +274,18 @@ final class CaptureEngine {
             configuration.pixelFormat = kCVPixelFormatType_32BGRA
         }
         var rect = videoFilter.contentRect
+        if let window = selectedWindowFrame {
+            // 浏览器可能把正文和工具栏拆成多个表面，独立窗口过滤器的原点不一定等于被选表面的原点。
+            guard selection.region == nil,
+                let aligned = CaptureGeometry.windowSourceRect(
+                    window: window, filter: videoFilter.contentRect,
+                    scale: CGFloat(videoFilter.pointPixelScale))
+            else {
+                throw RecorderError.message("所选窗口范围已变化，请重新选择。")
+            }
+            configuration.sourceRect = aligned
+            rect = aligned
+        }
         if let region = selection.region {
             let available = CGRect(
                 origin: .zero,
@@ -286,28 +300,30 @@ final class CaptureEngine {
             rect = aligned
         }
         let pixelScale = CGFloat(videoFilter.pointPixelScale)
-        var width = rect.width * pixelScale
-        var height = rect.height * pixelScale
-        if options.quality != .automatic {
-            let long: CGFloat = options.quality == .standard ? 1920 : 3840
-            let short: CGFloat = options.quality == .standard ? 1080 : 2160
-            let ratio = min(1, min(long / max(width, height), short / min(width, height)))
-            width *= ratio
-            height *= ratio
-        }
-        configuration.width = max(2, Int(width.rounded(.down)) / 2 * 2)
-        configuration.height = max(2, Int(height.rounded(.down)) / 2 * 2)
-        configuration.minimumFrameInterval =
-            options.frameRate == 0
-            ? .zero
-            : CMTime(
-                value: 1,
-                timescale: Int32(options.frameRate)
-            )
+        let size = CaptureGeometry.encodedSize(
+            for: CGSize(
+                width: rect.width * pixelScale,
+                height: rect.height * pixelScale
+            ),
+            quality: options.quality
+        )
+        configuration.width = Int(size.width)
+        configuration.height = Int(size.height)
+        // 会话使用启动时冻结的帧率上限，不跟随显示器刷新率升档。
+        configuration.minimumFrameInterval = CMTime(
+            value: 1,
+            timescale: Int32(options.frameRate == 60 ? 60 : 30)
+        )
         configuration.queueDepth = 3
         configuration.captureResolution = .best
         configuration.scalesToFit = true
         configuration.preservesAspectRatio = true
+        if selection.window != nil {
+            // 浏览器工具栏可能是正文窗口关联的子窗口，未被选中的子窗口不能随原窗口一起进入成片。
+            configuration.includeChildWindows = false
+            configuration.ignoreShadowsSingleWindow = true
+            configuration.ignoreGlobalClipSingleWindow = true
+        }
         configuration.showMouseClicks = options.showMouseClicks
         configuration.capturesAudio = options.systemAudio && !needsAudioHelper
         configuration.excludesCurrentProcessAudio = true
@@ -463,14 +479,16 @@ final class CaptureEngine {
             bridge: bridge
         )
         if screen {
-            try stream.addStreamOutput(bridge, type: .screen, sampleHandlerQueue: session.pipeline.queue)
+            try stream.addStreamOutput(
+                bridge, type: .screen, sampleHandlerQueue: session.pipeline.captureQueue)
         }
         if audio {
-            try stream.addStreamOutput(bridge, type: .audio, sampleHandlerQueue: session.pipeline.queue)
+            try stream.addStreamOutput(
+                bridge, type: .audio, sampleHandlerQueue: session.pipeline.captureQueue)
         }
         if microphone {
             try stream.addStreamOutput(
-                bridge, type: .microphone, sampleHandlerQueue: session.pipeline.queue)
+                bridge, type: .microphone, sampleHandlerQueue: session.pipeline.captureQueue)
         }
         bridge.onStop = { [weak self, weak session, weak handle] _, error in
             guard let self, let session, let handle, self.session === session else {

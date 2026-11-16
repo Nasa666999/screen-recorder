@@ -7,13 +7,93 @@ struct VideoSpecification {
     let height: Int
     let hdr: Bool
     let frameRate: Int
+
+    var framesPerSecond: Int {
+        frameRate == 60 ? 60 : 30
+    }
+
+    /// 业务作用: 将采集时间量化到会话的固定帧格，防止高刷新率回调穿透录制帧率上限。
+    /// 参数说明:
+    /// - time: 当前画面的宿主时钟时间。
+    /// - origin: 本次录制的视频与声音共同起点。
+    /// 返回: 同一帧格内的画面使用相同时间戳，由写入管线只保留一帧。
+    func frameTime(for time: CMTime, origin: CMTime) -> CMTime {
+        origin
+            + CMTimeConvertScale(
+                max(.zero, time - origin),
+                timescale: Int32(framesPerSecond),
+                method: .roundHalfAwayFromZero
+            )
+    }
+
+    /// 业务作用: 根据固定画布和帧率为长时间录制设置编码预算，兼顾细节与文件体积。
+    /// 参数说明:
+    /// - codec: 当前尺寸实际可用的硬件编码格式。
+    /// 返回: 编码器的平均码率、预期帧率与关键帧间隔在会话内保持不变。
+    func compressionSettings(for codec: AVVideoCodecType) -> [String: Any] {
+        let pixels = Double(width) * Double(height)
+        let scale = max(0.2, pixels / (1920 * 1080))
+        let baseRate = codec == .hevc ? 3_500_000.0 : 5_000_000.0
+        let rate = Int(baseRate * scale * (framesPerSecond == 60 ? 1.5 : 1) * (hdr ? 1.25 : 1))
+        var settings: [String: Any] = [
+            AVVideoAverageBitRateKey: rate,
+            AVVideoExpectedSourceFrameRateKey: framesPerSecond,
+            AVVideoMaxKeyFrameIntervalDurationKey: 2,
+            AVVideoAllowFrameReorderingKey: false,
+        ]
+        if hdr {
+            settings[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel
+        }
+        return settings
+    }
+
+    /// 业务作用: 按实际输出尺寸选择可用的高效硬件编码器，降低文件体积而不降低画布分辨率。
+    /// 参数说明: 无。
+    /// 返回: 优先使用 HEVC，SDR 不可用时选择 H.264；HDR 只使用 HEVC，全部不可用时明确失败。
+    func encoderCodec() throws -> AVVideoCodecType {
+        guard let width = Int32(exactly: width), let height = Int32(exactly: height),
+            width > 0, height > 0
+        else {
+            throw RecorderError.message("录制画面尺寸无效。")
+        }
+        let candidates: [(AVVideoCodecType, CMVideoCodecType)] =
+            hdr
+            ? [(.hevc, kCMVideoCodecType_HEVC)]
+            : [(.hevc, kCMVideoCodecType_HEVC), (.h264, kCMVideoCodecType_H264)]
+        let requirement =
+            [
+                kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true
+            ] as CFDictionary
+        for (codec, type) in candidates {
+            var properties: CFDictionary?
+            let status = VTCopySupportedPropertyDictionaryForEncoder(
+                width: width,
+                height: height,
+                codecType: type,
+                encoderSpecification: requirement,
+                encoderIDOut: nil,
+                supportedPropertiesOut: &properties
+            )
+            if status == noErr {
+                return codec
+            }
+        }
+        // 没有匹配的硬件编码器时不能偷偷改成软件编码、降低尺寸或把 HDR 标成 SDR。
+        throw RecorderError.message("硬件编码器不支持当前 \(width) × \(height) 的录制规格，请选择 1080p 或调整格式。")
+    }
 }
 
-// 媒体状态只由专用串行队列访问，回调在采集启动前设定；跨线程只传递受队列保护的所有者引用。
+// 混音与编码状态由媒体队列访问，输入预算由采集队列访问；回调在采集启动前设定。
 final class MediaPipeline: @unchecked Sendable {
+    let captureQueue = DispatchQueue(
+        label: "com.nasa666999.screen-recorder.capture",
+        qos: .userInitiated,
+        autoreleaseFrequency: .workItem
+    )
     let queue = DispatchQueue(
         label: "com.nasa666999.screen-recorder.media",
-        qos: .userInitiated
+        qos: .userInitiated,
+        autoreleaseFrequency: .workItem
     )
     var onStarted: (() -> Void)?
     var onFailure: ((Error) -> Void)?
@@ -35,6 +115,11 @@ final class MediaPipeline: @unchecked Sendable {
     private var failure: Error?
     private var blockedSince: CFTimeInterval?
     private var stopBoundary: CMTime?
+    private let videoSlots = DispatchSemaphore(value: 3)
+    private let audioSlots = DispatchSemaphore(value: 64)
+    private let ingressByteLimit = 128 * 1024 * 1024
+    private var pendingIngressBytes = 0
+    private var ingressFailureScheduled = false
 
     /// 业务作用: 立即固定收尾时间，停止请求之后到达的画面不得越界写入。
     /// 参数说明:
@@ -67,7 +152,47 @@ final class MediaPipeline: @unchecked Sendable {
         }
     }
 
-    /// 业务作用: 在采集回调队列直接消费样本，避免另建无界的待处理队列。
+    /// 业务作用: 从实时采集回调非阻塞地交付有限样本，编码或磁盘变慢不能无限占用采集缓冲。
+    /// 参数说明:
+    /// - sample: 当前采集样本，提交后由媒体队列持有至处理结束。
+    /// - type: 视频、系统声音或麦克风。
+    /// 返回: 最多排队三个视频和六十四个音频样本，合计不超过 128 MiB；视频拥塞丢帧，音频拥塞结束会话而不变速。
+    func enqueue(_ sample: CMSampleBuffer, type: SCStreamOutputType) {
+        dispatchPrecondition(condition: .onQueue(captureQueue))
+        guard !ingressFailureScheduled else {
+            return
+        }
+        let slots = type == .screen ? videoSlots : audioSlots
+        let pixelBytes = sample.imageBuffer.map(CVPixelBufferGetDataSize) ?? 0
+        let bytes = max(sample.totalSampleSize, pixelBytes)
+        // 数量限制不能约束高分辨率单帧或异常大音频块，同时核对字节预算，不能让大样本穿透内存边界。
+        guard bytes <= ingressByteLimit - pendingIngressBytes, slots.wait(timeout: .now()) == .success else {
+            if bytes > ingressByteLimit || type != .screen {
+                // 单个样本无法容纳或实时声音耗尽预算时明确结束，不能无限缓存或变速掩盖过载。
+                ingressFailureScheduled = true
+                let message =
+                    bytes > ingressByteLimit
+                    ? "单个媒体缓冲超过 128 MiB，无法在当前内存预算内录制，请缩小画面或调整分辨率。"
+                    : "声音输入持续积压，录制已停止以保留已取得的内容。"
+                queue.async {
+                    self.fail(RecorderError.message(message))
+                }
+            }
+            return
+        }
+        pendingIngressBytes += bytes
+        queue.async {
+            defer {
+                slots.signal()
+                self.captureQueue.async {
+                    self.pendingIngressBytes -= bytes
+                }
+            }
+            self.consume(sample, type: type)
+        }
+    }
+
+    /// 业务作用: 在唯一媒体队列处理已取得输入预算的样本，保持编码与混音状态串行。
     /// 参数说明:
     /// - sample: 当前采集样本。
     /// - type: 视频、系统声音或麦克风。
@@ -105,20 +230,25 @@ final class MediaPipeline: @unchecked Sendable {
                 if writer == nil {
                     try startWriter(sample)
                 }
-                guard sample.presentationTimeStamp > lastVideoTime || !lastVideoTime.isValid else {
+                guard let origin else {
+                    return
+                }
+                let time = specification.frameTime(for: sample.presentationTimeStamp, origin: origin)
+                guard time > lastVideoTime || !lastVideoTime.isValid else {
                     return
                 }
                 guard let videoInput, videoInput.isReadyForMoreMediaData else {
                     checkBackpressure()
                     return
                 }
-                guard writer?.status == .writing, videoInput.append(sample) else {
+                let frame = try videoSample(sample, at: time)
+                guard writer?.status == .writing, videoInput.append(frame) else {
                     throw writer?.error ?? RecorderError.message("视频写入失败。")
                 }
                 blockedSince = nil
                 let firstFrame = lastVideo == nil
-                lastVideo = sample
-                lastVideoTime = sample.presentationTimeStamp
+                lastVideo = frame
+                lastVideoTime = time
                 if firstFrame {
                     DispatchQueue.main.async { [weak self] in
                         self?.onStarted?()
@@ -149,24 +279,54 @@ final class MediaPipeline: @unchecked Sendable {
         }
     }
 
+    /// 业务作用: 为视频帧声明固定帧率对应的时间与持续时间，不复制像素或更改声音时间线。
+    /// 参数说明:
+    /// - sample: 已采集的画面或需要延长显示的末帧。
+    /// - time: 该画面在本次录制帧格上的宿主时间。
+    /// 返回: 共享原始像素且具有明确帧时长的样本，时间信息无法建立时抛错。
+    private func videoSample(_ sample: CMSampleBuffer, at time: CMTime) throws -> CMSampleBuffer {
+        var timing = CMSampleTimingInfo(
+            duration: CMTime(value: 1, timescale: Int32(specification.framesPerSecond)),
+            presentationTimeStamp: time,
+            decodeTimeStamp: .invalid
+        )
+        var copy: CMSampleBuffer?
+        guard
+            CMSampleBufferCreateCopyWithNewTiming(
+                allocator: kCFAllocatorDefault,
+                sampleBuffer: sample,
+                sampleTimingEntryCount: 1,
+                sampleTimingArray: &timing,
+                sampleBufferOut: &copy
+            ) == noErr, let copy
+        else {
+            throw RecorderError.message("无法建立固定帧率的视频时间线。")
+        }
+        return copy
+    }
+
     /// 业务作用: 以实际首帧建立编码器与宿主时钟起点，音频不能另起一条时间轴。
     /// 参数说明:
     /// - firstVideo: 全部采集流就绪后的第一帧。
     /// 返回: 编码规格不可用时失败，不静默降低质量。
     private func startWriter(_ firstVideo: CMSampleBuffer) throws {
+        // 在创建文件写入会话前核对硬件编码器能力，编码格式不改变用户选择的画布。
+        let codec = try specification.encoderCodec()
         let writer = try AVAssetWriter(
             outputURL: location.temporaryURL,
             fileType: .mov
         )
-        var compression: [String: Any] = [AVVideoAllowFrameReorderingKey: false]
-        if specification.hdr {
-            compression[AVVideoProfileLevelKey] = kVTProfileLevel_HEVC_Main10_AutoLevel
-        }
+        // 屏幕高刷新率仍表示实时播放，明确标记可避免播放器把录屏当作慢动作视频。
+        let playbackIntent = AVMutableMetadataItem()
+        playbackIntent.identifier = .quickTimeMetadataFullFrameRatePlaybackIntent
+        playbackIntent.value = NSNumber(value: 1)
+        playbackIntent.dataType = kCMMetadataBaseDataType_SInt8 as String
+        writer.metadata = [playbackIntent]
         var settings: [String: Any] = [
-            AVVideoCodecKey: specification.hdr ? AVVideoCodecType.hevc : AVVideoCodecType.h264,
+            AVVideoCodecKey: codec,
             AVVideoWidthKey: specification.width,
             AVVideoHeightKey: specification.height,
-            AVVideoCompressionPropertiesKey: compression,
+            AVVideoCompressionPropertiesKey: specification.compressionSettings(for: codec),
             AVVideoEncoderSpecificationKey: [
                 kVTVideoEncoderSpecification_RequireHardwareAcceleratedVideoEncoder as String: true
             ],
@@ -188,6 +348,8 @@ final class MediaPipeline: @unchecked Sendable {
             sourceFormatHint: firstVideo.formatDescription
         )
         video.expectsMediaDataInRealTime = true
+        video.mediaTimeScale = 60_000
+        video.preferredMediaChunkDuration = CMTime(seconds: 1, preferredTimescale: 600)
         guard writer.canAdd(video) else {
             throw RecorderError.message("无法添加视频轨道。")
         }
@@ -203,6 +365,7 @@ final class MediaPipeline: @unchecked Sendable {
                 ]
             )
             audioInput.expectsMediaDataInRealTime = true
+            audioInput.preferredMediaChunkDuration = CMTime(seconds: 1, preferredTimescale: 48_000)
             guard writer.canAdd(audioInput) else {
                 throw RecorderError.message("无法添加声音轨道。")
             }
@@ -362,11 +525,16 @@ final class MediaPipeline: @unchecked Sendable {
                 audio == nil
                 || audio!.cursor
                     >= Int64((CMTimeGetSeconds(time - origin!) * AudioPipeline.sampleRate).rounded(.down))
+            let endFrame = CMTimeConvertScale(
+                max(.zero, time - origin!),
+                timescale: Int32(specification.framesPerSecond),
+                method: .roundAwayFromZero
+            )
             let tailTime =
-                time
-                - CMTime(
-                    value: 1,
-                    timescale: 600
+                origin!
+                + CMTime(
+                    value: max(0, endFrame.value - 1),
+                    timescale: endFrame.timescale
                 )
             let needsTail = lastVideo != nil && tailTime > lastVideoTime
             if !audioDone || (needsTail && videoInput?.isReadyForMoreMediaData != true) {
@@ -379,25 +547,9 @@ final class MediaPipeline: @unchecked Sendable {
                 return
             }
             if needsTail, let lastVideo {
-                var timing = CMSampleTimingInfo(
-                    duration: CMTime(
-                        value: 1,
-                        timescale: 600
-                    ),
-                    presentationTimeStamp: tailTime,
-                    decodeTimeStamp: .invalid
-                )
-                var copy: CMSampleBuffer?
-                guard
-                    CMSampleBufferCreateCopyWithNewTiming(
-                        allocator: kCFAllocatorDefault,
-                        sampleBuffer: lastVideo,
-                        sampleTimingEntryCount: 1,
-                        sampleTimingArray: &timing,
-                        sampleBufferOut: &copy
-                    ) == noErr, let copy,
-                    videoInput?.append(copy) == true
-                else {
+                // 末帧同样落在固定帧格上，不能用极短的尾帧让文件重新呈现高帧率特征。
+                let copy = try videoSample(lastVideo, at: tailTime)
+                guard videoInput?.append(copy) == true else {
                     throw writer.error ?? RecorderError.message("无法完成静态视频尾帧。")
                 }
             }

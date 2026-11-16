@@ -36,9 +36,9 @@ enum Quality: String, Codable, CaseIterable {
     var title: String {
         switch self {
         case .automatic:
-            return "自动"
+            return "自动（原始分辨率）"
         case .standard:
-            return "标准（最长边 1920）"
+            return "标准（1080p）"
         case .clear:
             return "清晰（最长边 3840）"
         }
@@ -57,8 +57,9 @@ struct RecorderOptions: Codable {
     var systemAudio = true
     var audioApplicationBundleIDs: [String]?
     var microphoneID: String?
-    var quality = Quality.automatic
-    var frameRate = 0
+    var quality = Quality.standard
+    var qualityIsExplicit: Bool?
+    var frameRate = 30
     var countdown = 0
     var confirmBeforeRecording = false
     var hdr = false
@@ -81,12 +82,27 @@ struct RecorderOptions: Codable {
 
     /// 业务作用: 恢复用户主动选择的录制选项，损坏配置回到安全默认值。
     /// 参数说明: 无。
-    /// 返回: 麦克风默认关闭且系统声音默认开启的有效配置。
+    /// 返回: 默认使用 1080p、固定 30 fps、麦克风关闭且系统声音开启；用户明确选择的原始分辨率仍可保留。
     static func load() -> RecorderOptions {
         guard let data = UserDefaults.standard.data(forKey: "recorderOptions"),
-            let options = try? JSONDecoder().decode(RecorderOptions.self, from: data)
+            var options = try? JSONDecoder().decode(RecorderOptions.self, from: data)
         else {
             return RecorderOptions()
+        }
+        var changed = false
+        if options.quality == .automatic, options.qualityIsExplicit != true {
+            // 未明确选择原始分辨率时采用 1080p，避免保存的默认值继续把高分辨率来源交给编码器。
+            options.quality = .standard
+            options.qualityIsExplicit = false
+            changed = true
+        }
+        if ![30, 60].contains(options.frameRate) {
+            // 旧的自动帧率不能随高刷新率屏幕升到 120 fps，后续会话固定使用明确的帧率。
+            options.frameRate = 30
+            changed = true
+        }
+        if changed {
+            options.save()
         }
         return options
     }

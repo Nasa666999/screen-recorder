@@ -10,7 +10,7 @@ final class ArtifactController: NSObject, NSWindowDelegate,
     let url: URL
     private let location: RecordingLocation
     var onChange: (() -> Void)?
-    private(set) var busy = false
+    var onEdit: ((URL) -> Void)?
     private var deleted = false
     private var leases = 0
     private var identity: NSObject?
@@ -20,12 +20,9 @@ final class ArtifactController: NSObject, NSWindowDelegate,
     private var preview: NSWindow?
     private var playerView: AVPlayerView?
     private var picker: NSSharingServicePicker?
-    private var exporter: AVAssetExportSession?
-    private var buttons: [NSButton] = []
-    private var temporaryURL: URL?
 
     var hasWork: Bool {
-        busy || leases > 0
+        leases > 0
     }
 
     var hasVisibleUI: Bool {
@@ -127,7 +124,7 @@ final class ArtifactController: NSObject, NSWindowDelegate,
         return true
     }
 
-    /// 业务作用: 记录当前成品身份和内容状态，避免修剪覆盖外部进行的修改。
+    /// 业务作用: 记录当前成品身份和内容状态，避免录后操作使用外部已经改变的成品。
     /// 参数说明: 无。
     /// 返回: 文件元数据可读时更新快照；无法读取时抛错供调用者说明。
     private func rememberIdentity() throws {
@@ -141,7 +138,7 @@ final class ArtifactController: NSObject, NSWindowDelegate,
 
     /// 业务作用: 打开应用内原生视频预览，不转交外部播放器。
     /// 参数说明: 无。
-    /// 返回: 可播放、修剪、分享或删除已完成文件。
+    /// 返回: 可播放、打开剪辑、分享或删除已完成文件。
     @objc func showPreview() {
         guard validate() else {
             return
@@ -177,17 +174,16 @@ final class ArtifactController: NSObject, NSWindowDelegate,
         actions.spacing = 12
         actions.translatesAutoresizingMaskIntoConstraints = false
         let descriptors: [(String, Selector)] = [
-            ("修剪", #selector(trim)), ("分享", #selector(share(_:))),
+            ("剪辑与拼接", #selector(edit)), ("分享", #selector(share(_:))),
             ("移到废纸篓", #selector(trash)), ("完成", #selector(done)),
         ]
-        buttons = descriptors.map {
+        for descriptor in descriptors {
             let button = NSButton(
-                title: $0.0,
+                title: descriptor.0,
                 target: self,
-                action: $0.1
+                action: descriptor.1
             )
             actions.addArrangedSubview(button)
-            return button
         }
         root.addSubview(actions)
         window.contentView = root
@@ -207,102 +203,21 @@ final class ArtifactController: NSObject, NSWindowDelegate,
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    /// 业务作用: 用 AVKit 的原生修剪交互选择范围，提交后才写入独立临时文件。
+    /// 业务作用: 将录制成品交给独立的非破坏性剪辑窗口。
     /// 参数说明: 无。
-    /// 返回: 原文件在导出和身份复验成功前保持不变。
-    @objc private func trim() {
-        guard !hasWork, validate(), let playerView, playerView.canBeginTrimming else {
+    /// 返回: 暂停当前播放并打开剪辑，所有导出均另存新文件。
+    @objc private func edit() {
+        guard !hasWork, validate() else {
             return
         }
-        setBusy(true)
-        playerView.beginTrimming { [weak self] result in
-            Task { @MainActor in
-                guard let self else {
-                    return
-                }
-                guard result == .okButton, let item = playerView.player?.currentItem else {
-                    self.setBusy(false)
-                    return
-                }
-                let start = item.reversePlaybackEndTime
-                let end =
-                    item.forwardPlaybackEndTime.isNumeric ? item.forwardPlaybackEndTime : item.duration
-                await self.exportTrim(
-                    range: CMTimeRange(
-                        start: start,
-                        end: end
-                    ))
-            }
-        }
-    }
-
-    /// 业务作用: 先完整导出修剪结果，协同复验身份后原子替换本成品。
-    /// 参数说明:
-    /// - range: 用户在原生修剪界面确认的有效时间范围。
-    /// 返回: 失败保留原件；不允许迟到操作恢复已删除的文件。
-    private func exportTrim(range: CMTimeRange) async {
-        let temporary = url.deletingLastPathComponent().appendingPathComponent(
-            ".ScreenRecorder-trim-\(UUID().uuidString).mov")
-        temporaryURL = temporary
-        var committed = false
-        defer {
-            exporter = nil
-            temporaryURL = nil
-            try? FileManager.default.removeItem(at: temporary)
-            setBusy(false)
-        }
-        do {
-            guard range.isValid, range.duration > .zero,
-                let exporter = AVAssetExportSession(
-                    asset: AVURLAsset(url: url),
-                    presetName: AVAssetExportPresetPassthrough
-                )
-            else {
-                throw RecorderError.message("当前视频无法无损修剪。")
-            }
-            self.exporter = exporter
-            exporter.timeRange = range
-            try await exporter.export(to: temporary, as: .mov)
-            let asset = AVURLAsset(url: temporary)
-            guard try await asset.load(.duration) > .zero else {
-                throw RecorderError.message("修剪结果无有效时长，原视频已保留。")
-            }
-            guard validate(), leases == 0 else {
-                return
-            }
-            var coordinationError: NSError?
-            var replacementError: Error?
-            NSFileCoordinator().coordinate(
-                writingItemAt: url, options: .forReplacing, error: &coordinationError
-            ) { coordinated in
-                guard validate() else {
-                    replacementError = RecorderError.message("文件身份变化，原视频不作替换。")
-                    return
-                }
-                do {
-                    _ = try FileManager.default.replaceItemAt(coordinated, withItemAt: temporary)
-                } catch {
-                    replacementError = error
-                }
-            }
-            if let error = coordinationError ?? replacementError as NSError? {
-                throw error
-            }
-            committed = true
-            try rememberIdentity()
-            playerView?.player?.replaceCurrentItem(with: AVPlayerItem(url: url))
-        } catch {
-            issue(
-                committed
-                    ? "修剪已提交，但无法重新读取成品状态：\(error.localizedDescription)"
-                    : "修剪未提交，原文件保留：\(error.localizedDescription)")
-        }
+        playerView?.player?.pause()
+        onEdit?(url)
     }
 
     /// 业务作用: 在分享完成或取消前持有成品，避免分享链接指向被删除的文件。
     /// 参数说明:
     /// - sender: 分享按钮，用于定位系统分享菜单。
-    /// 返回: 分享期间拒绝修剪或删除同一文件。
+    /// 返回: 分享期间拒绝删除同一文件。
     @objc private func share(_ sender: NSButton) {
         guard !hasWork, validate() else {
             return
@@ -331,7 +246,7 @@ final class ArtifactController: NSObject, NSWindowDelegate,
     /// 参数说明:
     /// - sharingServicePicker: 当前分享菜单。
     /// - service: 用户选择的服务，取消时为空。
-    /// 返回: 取消不阻止之后修剪或删除。
+    /// 返回: 取消不阻止之后剪辑或删除。
     func sharingServicePicker(
         _ sharingServicePicker: NSSharingServicePicker, didChoose service: NSSharingService?
     ) {
@@ -429,18 +344,6 @@ final class ArtifactController: NSObject, NSWindowDelegate,
         playerView?.player = nil
         playerView = nil
         preview = nil
-        onChange?()
-    }
-
-    /// 业务作用: 更新成品操作门禁，所有破坏性按钮统一禁用。
-    /// 参数说明:
-    /// - value: 是否存在修剪交互或导出。
-    /// 返回: 新录制可独立运行，同一成品操作不可重入。
-    private func setBusy(_ value: Bool) {
-        busy = value
-        for button in buttons {
-            button.isEnabled = !value
-        }
         onChange?()
     }
 

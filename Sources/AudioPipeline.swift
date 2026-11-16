@@ -49,14 +49,18 @@ final class AudioPipeline {
     /// 参数说明:
     /// - sample: ScreenCaptureKit 提供的宿主时钟音频样本。
     /// - source: 系统声音或用户指定麦克风。
-    /// 返回: 样本进入有界队列；格式、积压或持续迟到异常时抛错。
+    /// 返回: 样本进入有界队列；单块超过两秒、格式无效、积压或持续迟到异常时抛错。
     func append(_ sample: CMSampleBuffer, source: AudioSource) throws {
         guard let description = sample.formatDescription, sample.numSamples > 0 else {
             throw RecorderError.message("采集音频格式无效。")
         }
         let inputFormat = AVAudioFormat(cmAudioFormatDescription: description)
-        guard inputFormat.sampleRate > 0 else {
+        guard inputFormat.sampleRate.isFinite, inputFormat.sampleRate > 0 else {
             throw RecorderError.message("采集音频采样率无效。")
+        }
+        // 先限制单块时长再分配 PCM 和转换缓冲，异常大样本不能在排队前占用大量内存。
+        guard Double(sample.numSamples) / inputFormat.sampleRate <= 2 else {
+            throw RecorderError.message("单个音频样本超过两秒，无法在实时缓存预算内处理。")
         }
         let count = AVAudioFrameCount(sample.numSamples)
         guard
