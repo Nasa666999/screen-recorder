@@ -157,16 +157,19 @@ struct MovieClip: Identifiable, @unchecked Sendable {
     let id: UUID
     let source: MovieSource
     var range: CMTimeRange
+    var watermarks: [MovieWatermarkRegion]
 
     /// 业务作用: 在来源上创建非破坏性的保留范围，多段可以共享同一个文件。
     /// 参数说明:
     /// - source: 已导入且持有访问权的视频。
     /// - range: 本片段保留的来源时间范围，空值表示完整视频。
+    /// - watermarks: 以来源时间和显示画面坐标保存的补全区域。
     /// 返回: 新片段拥有独立列表身份，不复制视频数据。
-    init(source: MovieSource, range: CMTimeRange? = nil) {
+    init(source: MovieSource, range: CMTimeRange? = nil, watermarks: [MovieWatermarkRegion] = []) {
         id = UUID()
         self.source = source
         self.range = range ?? source.info.bounds
+        self.watermarks = watermarks
     }
 
     /// 业务作用: 在指定播放位置把一个保留范围分为连续的两段。
@@ -182,11 +185,13 @@ struct MovieClip: Identifiable, @unchecked Sendable {
         return [
             MovieClip(
                 source: source,
-                range: left
+                range: left,
+                watermarks: watermarks
             ),
             MovieClip(
                 source: source,
-                range: right
+                range: right,
+                watermarks: watermarks
             ),
         ]
     }
@@ -207,7 +212,8 @@ struct MovieClip: Identifiable, @unchecked Sendable {
                 MovieClip(
                     source: source,
                     range: try MovieTime.selectionRange(
-                        start: range.start, end: selection.start, within: source.info.bounds)
+                        start: range.start, end: selection.start, within: source.info.bounds),
+                    watermarks: watermarks
                 ))
         }
         if selection.end < range.end {
@@ -215,7 +221,8 @@ struct MovieClip: Identifiable, @unchecked Sendable {
                 MovieClip(
                     source: source,
                     range: try MovieTime.selectionRange(
-                        start: selection.end, end: range.end, within: source.info.bounds)
+                        start: selection.end, end: range.end, within: source.info.bounds),
+                    watermarks: watermarks
                 ))
         }
         return result
@@ -230,6 +237,9 @@ struct MovieClip: Identifiable, @unchecked Sendable {
             range.start >= source.info.bounds.start, range.end <= source.info.bounds.end
         else {
             throw RecorderError.message("片段范围无效：\(source.url.lastPathComponent)")
+        }
+        for region in watermarks {
+            try region.validate(within: source.info.bounds)
         }
     }
 
@@ -322,17 +332,19 @@ enum MovieEditExporter {
         )
     }
 
-    /// 业务作用: 导出新的 MOV 文件，保持源视频帧时序且不覆盖任何已有文件。
+    /// 业务作用: 导出新的 MOV 文件，按计划补全画面、调整声音且不覆盖任何已有文件。
     /// 参数说明:
     /// - clips: 用户确认的有序保留范围。
     /// - destination: 用户选择的新文件位置。
     /// - audioAdjustment: 导出时的音量处理方式，默认保留原始声音。
+    /// - preparedPreview: 可选的完整预览，仅在计划与声音设置完全一致时复用媒体。
     /// - progress: 导出进度回调，运行在后台任务中。
     /// - audioProgress: 声音检查与处理期间的用户说明。
     /// 返回: 完整验证并独占发布后返回目标位置；失败或取消只清理本次临时文件。
     static func export(
         _ clips: [MovieClip], to destination: URL,
         audioAdjustment: MovieAudioAdjustment = .original,
+        preparedPreview: MoviePreview? = nil,
         progress: @escaping @Sendable (Double) -> Void,
         audioProgress: @escaping @Sendable (String) -> Void = { _ in }
     ) async throws -> URL {
@@ -346,17 +358,37 @@ enum MovieEditExporter {
             ".ScreenRecorder-edit-\(UUID().uuidString).partial.mov")
         let audioURL = destination.deletingLastPathComponent().appendingPathComponent(
             ".ScreenRecorder-audio-\(UUID().uuidString).m4a")
+        let videoURL = destination.deletingLastPathComponent().appendingPathComponent(
+            ".ScreenRecorder-inpaint-\(UUID().uuidString).mov")
         defer {
             try? FileManager.default.removeItem(at: temporary)
             try? FileManager.default.removeItem(at: audioURL)
+            try? FileManager.default.removeItem(at: videoURL)
         }
         let composition = try await compose(clips)
         let enhanced = audioAdjustment != .original && composition.hasAudio
-        let asset = try await MovieAudioEnhancer.prepare(
-            asset: composition.asset, adjustment: audioAdjustment, audioURL: audioURL
-        ) { value, message in
-            progress(value * 0.65)
-            audioProgress(message)
+        let inpainting = !MovieWatermarkProcessor.intervals(clips).isEmpty
+        let reusable = preparedPreview?.matches(clips, adjustment: audioAdjustment) == true
+        let videoWeight = inpainting && !reusable ? 0.85 : 0.0
+        let audioWeight = enhanced && !reusable ? (inpainting ? 0.10 : 0.65) : 0.0
+        let asset: AVComposition
+        if reusable, let preparedPreview {
+            // 持有预览直到导出结束，防止临时媒体在封装期间被播放器切换释放。
+            asset = preparedPreview.asset
+            audioProgress("正在使用已确认的预览画面与声音封装新视频…")
+        } else {
+            let video = try await MovieWatermarkProcessor.prepare(
+                composition.asset, clips: clips, to: videoURL
+            ) { value, message in
+                progress(value * videoWeight)
+                audioProgress(message)
+            }
+            asset = try await MovieAudioEnhancer.prepare(
+                asset: video, adjustment: audioAdjustment, audioURL: audioURL
+            ) { value, message in
+                progress(videoWeight + value * audioWeight)
+                audioProgress(message)
+            }
         }
         guard
             let exporter = AVAssetExportSession(
@@ -373,7 +405,8 @@ enum MovieEditExporter {
         let monitor = Task {
             for await state in exporter.states(updateInterval: 0.2) {
                 if case .exporting(let value) = state {
-                    progress((enhanced ? 0.65 : 0) + value.fractionCompleted * (enhanced ? 0.35 : 1))
+                    progress(
+                        videoWeight + audioWeight + value.fractionCompleted * (1 - videoWeight - audioWeight))
                 }
             }
         }
@@ -407,6 +440,30 @@ enum MovieEditExporter {
 }
 
 enum MovieTime {
+    /// 业务作用: 为重编码选择能精确表达来源帧和剪切边界的公共时间刻度。
+    /// 参数说明:
+    /// - scales: 所有来源、剪切范围与合成使用的有效刻度。
+    /// 返回: 不超过媒体格式上限的最小公倍数；无法无损组合时明确拒绝。
+    static func commonScale(_ scales: [CMTimeScale]) throws -> CMTimeScale {
+        var result: Int64 = 1
+        for scale in scales {
+            guard scale > 0 else {
+                throw RecorderError.message("来源包含无效的媒体时间刻度。")
+            }
+            var a = result
+            var b = Int64(scale)
+            while b != 0 {
+                (a, b) = (b, a % b)
+            }
+            let next = (result / a) * Int64(scale)
+            guard next <= Int64(Int32.max) else {
+                throw RecorderError.message("这些来源的时间精度无法组合为同一补全视频，请分别处理来源。")
+            }
+            result = next
+        }
+        return CMTimeScale(result)
+    }
+
     /// 业务作用: 将播放位置和来源边界放到同一编辑刻度，避免时间范围运算把合法末端舍入到来源之外。
     /// 参数说明:
     /// - start: 已限定在来源内的选区起点，可以来自播放器的纳秒时间线。

@@ -1,0 +1,9 @@
+LaMa: Resolution-robust Large Mask Inpainting with Fourier Convolutions
+Copyright Samsung AI Center / advimman. Licensed under the Apache License, Version 2.0 (LICENSE).
+Original code and weights: https://github.com/advimman/lama — weights "big-lama" from
+https://huggingface.co/smartywu/big-lama (the download the official README points to).
+
+This repository redistributes a Core ML conversion of big-lama (LaMa.mlpackage). The package
+was published without a licence statement at huggingface.co/jerhoads/lama-coreml (commit
+da9859ec149712a4bba6dfb2946f097b026bc8ec); its weights were verified here to be big-lama
+(see README.md and verify_against_official.py). The files are unmodified.

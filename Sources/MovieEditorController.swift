@@ -19,6 +19,7 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
     private var closing = false
     private var previewingComposition = false
     private var preparedPreview: MoviePreview?
+    private var watermarkEditor: MovieWatermarkController?
     private let player = AVPlayer()
     private var timeObserver: Any?
     private let table = NSTableView()
@@ -139,6 +140,7 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
         heading.font = .systemFont(ofSize: 14, weight: .semibold)
         sidebar.addArrangedSubview(heading)
         sidebar.addArrangedSubview(button("添加视频…", action: #selector(chooseFiles)))
+        sidebar.addArrangedSubview(button("分时段去水印…", action: #selector(editWatermarks)))
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("clip"))
         column.width = 274
         table.addTableColumn(column)
@@ -552,6 +554,7 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
         player.seek(to: clip.range.start, toleranceBefore: .zero, toleranceAfter: .zero)
         sourceLabel.stringValue =
             "\(clip.source.url.lastPathComponent) · \(Int(clip.source.info.size.width)) × \(Int(clip.source.info.size.height)) · \(clip.source.frameRateDescription)"
+            + (clip.watermarks.isEmpty ? "" : " · \(clip.watermarks.count) 个水印时段")
         for slider in [startSlider, endSlider] {
             slider.minValue = clip.range.start.seconds
             slider.maxValue = clip.range.end.seconds
@@ -723,8 +726,12 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
         clearSuggestion()
         let total = clips.reduce(CMTime.zero) { $0 + $1.range.duration }
         let bytes = clips.reduce(0.0) { $0 + $1.estimatedBytes }
+        let inpainting = !MovieWatermarkProcessor.intervals(clips).isEmpty
         summaryLabel.stringValue =
-            "\(clips.count) 个片段 · 总时长 \(MovieTime.string(total))\n预计约 \(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)) · 保留源帧率"
+            "\(clips.count) 个片段 · 总时长 \(MovieTime.string(total))\n"
+            + (inpainting
+                ? "画面补全 · HEVC 重编码 · 保留帧时序"
+                : "预计约 \(ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)) · 保留源帧率")
         if clips.isEmpty {
             player.pause()
             player.replaceCurrentItem(with: nil)
@@ -832,6 +839,7 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
         redoHistory.append(clips)
         clips = previous
         reloadPlan(selecting: table.selectedRow)
+        statusLabel.stringValue = "已撤销上一步编辑。水印设置、剪切范围和片段顺序均以当前计划为准。"
     }
 
     /// 业务作用: 重做最近撤回的编辑计划。
@@ -844,6 +852,7 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
         undoHistory.append(clips)
         clips = next
         reloadPlan(selecting: table.selectedRow)
+        statusLabel.stringValue = "已重做上一步编辑。"
     }
 
     /// 业务作用: 预览当前完整拼接计划，提交导出前检查顺序和声音。
@@ -853,11 +862,40 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
         preview(clips, seam: nil)
     }
 
-    /// 业务作用: 按当前音量设置播放完整计划或接缝，使用与导出相同的声音处理。
+    /// 业务作用: 为选中片段打开可拖框的分时段水印设置，将确认结果纳入撤销历史。
+    /// 参数说明: 无。
+    /// 返回: 确认后更新当前片段；取消或来源选择失效时保留原计划。
+    @objc private func editWatermarks() {
+        guard !hasWork, let index = selectedIndex, let window else {
+            return
+        }
+        player.pause()
+        let id = clips[index].id
+        let editor = MovieWatermarkController(clip: clips[index]) { [weak self] regions in
+            guard let self, clips.indices.contains(index), clips[index].id == id else {
+                return
+            }
+            var next = clips
+            next[index].watermarks = regions
+            commit(next, selecting: index)
+            statusLabel.stringValue =
+                regions.isEmpty
+                ? "当前片段已关闭画面补全。"
+                : "已设置 \(regions.count) 个水印时段。点击“预览全部”检查补全画面与声音，再导出。"
+        }
+        watermarkEditor = editor
+        if let sheet = editor.window {
+            window.beginSheet(sheet) { [weak self] _ in
+                self?.watermarkEditor = nil
+            }
+        }
+    }
+
+    /// 业务作用: 按当前水印与音量设置播放完整计划或接缝，复用与导出相同的媒体处理。
     /// 参数说明:
     /// - plan: 用于本次预览的片段副本。
     /// - seam: 需要查看的接缝序号，空值表示完整预览。
-    /// 返回: 声音准备完成后播放合成；取消或失败不开始播放，临时声音由预览生命周期清理。
+    /// 返回: 媒体准备完成后播放合成；取消或失败不开始播放，临时媒体由预览生命周期清理。
     private func preview(_ plan: [MovieClip], seam: Int?) {
         guard !hasWork, !plan.isEmpty else {
             return
@@ -879,14 +917,22 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
                 finishWork(restoreSource: false)
             }
             do {
-                let preview = try await MoviePreview.prepare(plan, adjustment: adjustment) {
-                    [weak self] value, message in
-                    Task { @MainActor in
-                        guard let self, self.operationID == request, self.hasWork else {
-                            return
+                let preview: MoviePreview
+                if let cached = preparedPreview, cached.matches(plan, adjustment: adjustment) {
+                    for clip in plan {
+                        try clip.validate()
+                    }
+                    preview = cached
+                } else {
+                    preview = try await MoviePreview.prepare(plan, adjustment: adjustment) {
+                        [weak self] value, message in
+                        Task { @MainActor in
+                            guard let self, self.operationID == request, self.hasWork else {
+                                return
+                            }
+                            self.progress.doubleValue = value
+                            self.statusLabel.stringValue = message
                         }
-                        self.progress.doubleValue = value
-                        self.statusLabel.stringValue = message
                     }
                 }
                 try Task.checkCancellation()
@@ -920,7 +966,7 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
                 player.play()
                 statusLabel.stringValue =
                     seam == nil
-                    ? "正在按当前音量预览全部。点击“当前片段”返回剪切。"
+                    ? "正在按当前水印和音量设置预览全部。点击“当前片段”返回来源画面。"
                     : "正在按当前音量试听接缝前后三秒。确认连贯后可采用建议。"
             } catch {
                 report(error)
@@ -1057,7 +1103,11 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
             report(error)
             return
         }
-        beginWork("正在导出新视频，保留源帧率和画质…")
+        let preview = preparedPreview
+        beginWork(
+            MovieWatermarkProcessor.intervals(plan).isEmpty
+                ? "正在导出新视频，保留源帧率和画质…"
+                : "正在准备画面补全与新视频导出…")
         let request = operationID
         operation = Task(priority: .utility) { [weak self] in
             guard let self else {
@@ -1072,7 +1122,7 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
             }
             do {
                 let url = try await MovieEditExporter.export(
-                    plan, to: destination, audioAdjustment: adjustment,
+                    plan, to: destination, audioAdjustment: adjustment, preparedPreview: preview,
                     progress: { [weak self] value in
                         Task { @MainActor in
                             guard let self, self.operationID == request, self.hasWork else {
