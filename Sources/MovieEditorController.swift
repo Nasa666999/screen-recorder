@@ -139,10 +139,13 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
         let heading = NSTextField(labelWithString: "片段 · 按列表顺序拼接")
         heading.font = .systemFont(ofSize: 14, weight: .semibold)
         sidebar.addArrangedSubview(heading)
-        sidebar.addArrangedSubview(button("添加视频…", action: #selector(chooseFiles)))
-        sidebar.addArrangedSubview(button("分时段去水印…", action: #selector(editWatermarks)))
+        let imports = NSStackView(views: [
+            button("添加视频…", action: #selector(chooseFiles)),
+            button("分时段去水印…", action: #selector(editWatermarks)),
+        ])
+        imports.spacing = 8
+        sidebar.addArrangedSubview(imports)
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("clip"))
-        column.width = 274
         table.addTableColumn(column)
         table.headerView = nil
         table.rowHeight = 56
@@ -182,22 +185,22 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
         scroll.borderType = .bezelBorder
         scroll.translatesAutoresizingMaskIntoConstraints = false
         sidebar.addArrangedSubview(scroll)
-        let order = NSStackView(views: [
-            button("上移", action: #selector(moveClipUp)),
-            button("下移", action: #selector(moveClipDown)),
-            button("移除", action: #selector(removeClip)),
-        ])
-        order.spacing = 8
-        sidebar.addArrangedSubview(order)
         undoButton = button("撤销", action: #selector(undoEdit))
         undoButton.keyEquivalent = "z"
         undoButton.keyEquivalentModifierMask = [.command]
         redoButton = button("重做", action: #selector(redoEdit))
         redoButton.keyEquivalent = "z"
         redoButton.keyEquivalentModifierMask = [.command, .shift]
-        let history = NSStackView(views: [undoButton, redoButton])
-        history.spacing = 8
-        sidebar.addArrangedSubview(history)
+        let order = NSStackView(views: [
+            button("上移", action: #selector(moveClipUp)),
+            button("下移", action: #selector(moveClipDown)),
+            button("移除", action: #selector(removeClip)),
+            undoButton, redoButton,
+        ])
+        order.spacing = 4
+        sidebar.addArrangedSubview(order)
+        let sidebarWidth = max(282, order.fittingSize.width, imports.fittingSize.width)
+        column.width = sidebarWidth - 8
         summaryLabel.font = .systemFont(ofSize: 11)
         summaryLabel.textColor = .secondaryLabelColor
         sidebar.addArrangedSubview(summaryLabel)
@@ -332,7 +335,7 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
             sidebar.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 16),
             sidebar.topAnchor.constraint(equalTo: root.topAnchor, constant: 16),
             sidebar.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -16),
-            sidebar.widthAnchor.constraint(equalToConstant: 282),
+            sidebar.widthAnchor.constraint(equalToConstant: sidebarWidth),
             workspace.leadingAnchor.constraint(equalTo: sidebar.trailingAnchor, constant: 16),
             workspace.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -16),
             workspace.topAnchor.constraint(equalTo: sidebar.topAnchor),
