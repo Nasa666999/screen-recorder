@@ -1,4 +1,4 @@
-import AVFoundation
+import AVKit
 import AppKit
 
 @MainActor
@@ -8,15 +8,24 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
     private let clip: MovieClip
     private var regions: [MovieWatermarkRegion]
     private let onApply: ([MovieWatermarkRegion]) -> Void
+    var onClose: (() -> Void)?
     private var editing: Int?
     private var frameTask: Task<Void, Never>?
     private var previewTask: Task<Void, Never>?
     private var frameID = UUID()
     private var originalFrame: CGImage?
     private let canvas = MovieWatermarkCanvas()
+    private let player = AVPlayer()
+    private let playerView = AVPlayerView()
+    private let surface = NSView()
+    private var timeObserver: Any?
+    private var playbackButton: NSButton!
+    private var maximizeButton: NSButton!
+    private var compactViews: [NSView] = []
     private let table = NSTableView()
     private let start = NSTextField()
     private let end = NSTextField()
+    private let quality = NSPopUpButton()
     private let slider = NSSlider()
     private let position = NSTextField(labelWithString: "")
     private let status = NSTextField(wrappingLabelWithString: "在画面上拖框，包含完整水印和少量边缘，再保存生效时段。")
@@ -33,17 +42,47 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         regions = clip.watermarks
         self.onApply = onApply
         let screen = NSScreen.main?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1280, height: 800)
-        let window = NSWindow(
+        let window = MovieWatermarkWindow(
             contentRect: NSRect(
                 x: 0, y: 0, width: min(1080, screen.width - 60), height: min(760, screen.height - 60)),
-            styleMask: [.titled, .closable, .resizable], backing: .buffered, defer: false)
+            styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         super.init(window: window)
         window.title = "分时段去水印 · \(clip.source.url.lastPathComponent)"
         window.minSize = NSSize(width: 850, height: 650)
         window.isReleasedWhenClosed = false
         window.delegate = self
+        window.collectionBehavior = [.fullScreenPrimary]
+        window.onEscape = { [weak self] in
+            guard let self, let window = self.window else {
+                return
+            }
+            if window.styleMask.contains(.fullScreen) {
+                window.toggleFullScreen(nil)
+            } else {
+                dismiss()
+            }
+        }
+        let item = AVPlayerItem(asset: clip.source.asset)
+        item.reversePlaybackEndTime = clip.range.start
+        item.forwardPlaybackEndTime = clip.range.end
+        player.replaceCurrentItem(with: item)
+        timeObserver = player.addPeriodicTimeObserver(
+            forInterval: CMTime(value: 1, timescale: 20), queue: .main
+        ) { [weak self] time in
+            MainActor.assumeIsolated {
+                guard let self, !self.finished, self.player.rate != 0 else {
+                    return
+                }
+                self.slider.doubleValue = time.seconds
+                self.position.stringValue = "来源位置 \(MovieTime.string(time))"
+                if time >= clip.range.end - CMTime(value: 1, timescale: 60) {
+                    self.pausePlayback()
+                }
+            }
+        }
         buildInterface()
         newRegion()
+        window.center()
     }
 
     /// 业务作用: 禁止从不含来源访问的归档创建水印编辑窗口。
@@ -80,13 +119,32 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
             wrappingLabelWithString:
                 "拖动框选水印，可按时段更换位置；同一时段可保存多个框。时间以来源视频为准，剪切后自动取交集。")
         hint.font = .systemFont(ofSize: 12)
+        compactViews.append(hint)
         root.addArrangedSubview(hint)
         canvas.setAccessibilityLabel("水印框选画面")
         canvas.setAccessibilityHelp("按住鼠标左键拖动，框住水印。重新拖动可更换当前框。")
         canvas.onChange = { [weak self] in
+            self?.pausePlayback()
             self?.restoreOriginal()
         }
-        root.addArrangedSubview(canvas)
+        let displayed = CGRect(origin: .zero, size: clip.source.info.size).applying(
+            clip.source.info.transform)
+        canvas.mediaSize = displayed.size
+        playerView.player = player
+        playerView.controlsStyle = .none
+        playerView.videoGravity = .resizeAspect
+        canvas.wantsLayer = true
+        for view in [playerView, canvas] {
+            view.translatesAutoresizingMaskIntoConstraints = false
+            surface.addSubview(view)
+            NSLayoutConstraint.activate([
+                view.leadingAnchor.constraint(equalTo: surface.leadingAnchor),
+                view.trailingAnchor.constraint(equalTo: surface.trailingAnchor),
+                view.topAnchor.constraint(equalTo: surface.topAnchor),
+                view.bottomAnchor.constraint(equalTo: surface.bottomAnchor),
+            ])
+        }
+        root.addArrangedSubview(surface)
         slider.minValue = clip.range.start.seconds
         slider.maxValue = clip.range.end.seconds
         slider.target = self
@@ -95,7 +153,12 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         slider.setAccessibilityLabel("水印画面播放位置")
         controls.append(slider)
         position.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
-        let locate = NSStackView(views: [position, slider])
+        playbackButton = button("播放", action: #selector(togglePlayback))
+        maximizeButton = button("画面最大化", action: #selector(toggleMaximized))
+        let locate = NSStackView(views: [
+            playbackButton, button("◀ 一帧", action: #selector(stepBackward)),
+            button("一帧 ▶", action: #selector(stepForward)), position, slider, maximizeButton,
+        ])
         locate.spacing = 12
         root.addArrangedSubview(locate)
         for field in [start, end] {
@@ -112,6 +175,7 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         ])
         timing.spacing = 8
         root.addArrangedSubview(timing)
+        compactViews.append(timing)
         let actions = NSStackView(views: [
             button("保存时段", action: #selector(saveRegion)),
             button("新增时段", action: #selector(newRegion)),
@@ -119,8 +183,14 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
             button("预览当前帧", action: #selector(previewFrame)),
             button("显示原画面", action: #selector(restoreOriginal)),
         ])
+        quality.addItems(withTitles: ["标准（较快）", "精细（较慢）"])
+        quality.setAccessibilityLabel("画面补全质量")
+        quality.toolTip = "标准使用较小模型输入提高速度；复杂纹理可切换精细，并先比较当前帧。两种模式都处理每一帧。"
+        controls.append(quality)
+        actions.addArrangedSubview(quality)
         actions.spacing = 8
         root.addArrangedSubview(actions)
+        compactViews.append(actions)
         let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("watermark"))
         column.width = 900
         table.addTableColumn(column)
@@ -136,22 +206,24 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         scroll.hasVerticalScroller = true
         scroll.borderType = .bezelBorder
         root.addArrangedSubview(scroll)
+        compactViews.append(scroll)
         status.font = .systemFont(ofSize: 11)
         status.textColor = .secondaryLabelColor
         status.maximumNumberOfLines = 2
         root.addArrangedSubview(status)
+        compactViews.append(status)
         let cancel = NSButton(title: "取消", target: self, action: #selector(cancel))
-        cancel.keyEquivalent = "\u{1b}"
         let footer = NSStackView(views: [cancel, button("应用到片段", action: #selector(apply))])
         footer.spacing = 10
         root.addArrangedSubview(footer)
-        for view in [hint, canvas, locate, scroll, status] {
+        compactViews.append(footer)
+        for view in [hint, surface, locate, scroll, status] {
             view.translatesAutoresizingMaskIntoConstraints = false
             view.widthAnchor.constraint(equalTo: root.widthAnchor, constant: -32).isActive = true
         }
-        canvas.heightAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
+        surface.heightAnchor.constraint(greaterThanOrEqualToConstant: 220).isActive = true
         scroll.heightAnchor.constraint(equalToConstant: 108).isActive = true
-        slider.widthAnchor.constraint(greaterThanOrEqualToConstant: 250).isActive = true
+        slider.widthAnchor.constraint(greaterThanOrEqualToConstant: 100).isActive = true
     }
 
     /// 业务作用: 把输入字段和当前框解析为可执行的补全时段。
@@ -167,6 +239,7 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         var result = editing.map { regions[$0] } ?? MovieWatermarkRegion(range: range, rect: rect)
         result.range = range
         result.rect = rect
+        result.quality = quality.indexOfSelectedItem == 0 ? .standard : .detailed
         try result.validate(within: clip.source.info.bounds)
         return result
     }
@@ -226,6 +299,7 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         editing = nil
         table.deselectAll(nil)
         canvas.rect = nil
+        quality.selectItem(at: 0)
         start.stringValue = MovieTime.string(lower)
         end.stringValue = MovieTime.string(clip.range.end)
         // 毫秒文本仅用于显示；未修改的来源末端在解析时恢复为真实边界。
@@ -245,6 +319,7 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         start.stringValue = MovieTime.string(region.range.start)
         end.stringValue = MovieTime.string(region.range.end)
         canvas.rect = region.rect
+        quality.selectItem(at: region.quality == .standard ? 0 : 1)
         slider.doubleValue = min(
             clip.range.end.seconds, max(clip.range.start.seconds, region.range.start.seconds))
         loadFrame()
@@ -269,6 +344,103 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         loadFrame()
     }
 
+    /// 业务作用: 在框选窗口播放来源视频，暂停时保留可精确圈选的画面。
+    /// 参数说明: 无。
+    /// 返回: 播放位置与时段字段共用来源时间，播放不会执行模型补全。
+    @objc private func togglePlayback() {
+        guard previewTask == nil else {
+            return
+        }
+        if player.rate != 0 {
+            pausePlayback()
+            slider.doubleValue = player.currentTime().seconds
+            loadFrame()
+            return
+        }
+        frameTask?.cancel()
+        frameID = UUID()
+        originalFrame = nil
+        canvas.image = nil
+        canvas.showsOutline = true
+        canvas.isEnabled = true
+        if player.currentTime() >= clip.range.end - CMTime(value: 1, timescale: 60) {
+            player.seek(to: clip.range.start, toleranceBefore: .zero, toleranceAfter: .zero)
+        }
+        player.play()
+        playbackButton.title = "暂停"
+    }
+
+    /// 业务作用: 停止来源播放，避免绘框或关闭窗口时画面继续移动或发声。
+    /// 参数说明: 无。
+    /// 返回: 播放器暂停，按钮恢复为播放入口。
+    private func pausePlayback() {
+        player.pause()
+        playbackButton?.title = "播放"
+    }
+
+    /// 业务作用: 在当前来源画面向前定位一个真实视频帧。
+    /// 参数说明: 无。
+    /// 返回: 暂停播放并刷新定位后的精确画面。
+    @objc private func stepBackward() {
+        step(by: -1)
+    }
+
+    /// 业务作用: 在当前来源画面向后定位一个真实视频帧。
+    /// 参数说明: 无。
+    /// 返回: 暂停播放并刷新定位后的精确画面。
+    @objc private func stepForward() {
+        step(by: 1)
+    }
+
+    /// 业务作用: 将逐帧动作交给播放器，适应来源的可变帧率。
+    /// 参数说明:
+    /// - count: 步进方向与帧数。
+    /// 返回: 播放器移动后异步提取同一时刻的画面，旧定位不能覆盖新画面。
+    private func step(by count: Int) {
+        pausePlayback()
+        frameID = UUID()
+        let request = frameID
+        player.currentItem?.step(byCount: count)
+        Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(100))
+            guard let self, !finished, frameID == request else {
+                return
+            }
+            slider.doubleValue = min(
+                clip.range.end.seconds, max(clip.range.start.seconds, player.currentTime().seconds))
+            loadFrame()
+        }
+    }
+
+    /// 业务作用: 让来源画面占满屏幕，同时保留播放和退出最大化操作。
+    /// 参数说明: 无。
+    /// 返回: 使用系统全屏窗口，框的比例坐标保持不变。
+    @objc private func toggleMaximized() {
+        window?.toggleFullScreen(nil)
+    }
+
+    /// 业务作用: 系统进入全屏时收起时段表单，把空间交给视频画面。
+    /// 参数说明:
+    /// - notification: 系统全屏切换通知。
+    /// 返回: 播放和框选继续可用。
+    func windowWillEnterFullScreen(_ notification: Notification) {
+        for view in compactViews {
+            view.isHidden = true
+        }
+        maximizeButton.title = "退出画面最大化"
+    }
+
+    /// 业务作用: 退出全屏后恢复时间段编辑与确认操作。
+    /// 参数说明:
+    /// - notification: 系统全屏切换通知。
+    /// 返回: 保留当前框和播放位置。
+    func windowDidExitFullScreen(_ notification: Notification) {
+        for view in compactViews {
+            view.isHidden = false
+        }
+        maximizeButton.title = "画面最大化"
+    }
+
     /// 业务作用: 把当前来源位置作为水印生效起点。
     /// 参数说明: 无。
     /// 返回: 仅更新草稿字段。
@@ -287,6 +459,7 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
     /// 参数说明: 无。
     /// 返回: 只接纳最后一次定位的画面，关闭后不再发布图像。
     private func loadFrame() {
+        pausePlayback()
         frameTask?.cancel()
         originalFrame = nil
         frameID = UUID()
@@ -295,12 +468,15 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
             clip.range.end - CMTime(value: 1, timescale: 48_000),
             CMTime(seconds: slider.doubleValue, preferredTimescale: 48_000))
         position.stringValue = "来源位置 \(MovieTime.string(time))"
+        player.seek(to: time, toleranceBefore: .zero, toleranceAfter: .zero)
         let source = clip.source
         canvas.isEnabled = false
         frameTask = Task { [weak self] in
             do {
                 let generator = AVAssetImageGenerator(asset: source.asset)
                 generator.appliesPreferredTrackTransform = true
+                generator.requestedTimeToleranceBefore = .zero
+                generator.requestedTimeToleranceAfter = .zero
                 let result = try await generator.image(at: time)
                 try Task.checkCancellation()
                 guard let self, !finished, frameID == request else {
@@ -322,6 +498,21 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
     /// 参数说明: 无。
     /// 返回: 推理完成后显示补全画面，不保存视频也不改动原文件。
     @objc private func previewFrame() {
+        pausePlayback()
+        if originalFrame == nil, previewTask == nil {
+            slider.doubleValue = player.currentTime().seconds
+            loadFrame()
+            let loading = frameTask
+            let request = frameID
+            Task { [weak self] in
+                await loading?.value
+                guard let self, !finished, frameID == request, originalFrame != nil else {
+                    return
+                }
+                previewFrame()
+            }
+            return
+        }
         guard previewTask == nil, let originalFrame else {
             return
         }
@@ -335,14 +526,14 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
             }
             var active = regions.enumerated().filter {
                 $0.offset != editing && time >= $0.element.range.start && time < $0.element.range.end
-            }.map { $0.element.rect }
-            active.append(pending.rect)
-            let rects = active
+            }.map { $0.element }
+            active.append(pending)
+            let regions = active
             setBusy(true)
             status.stringValue = "正在本地补全当前帧…"
             previewTask = Task { [weak self] in
                 do {
-                    let result = try await MovieWatermarkFrame.render(originalFrame, rects: rects)
+                    let result = try await MovieWatermarkFrame.render(originalFrame, regions: regions)
                     try Task.checkCancellation()
                     guard let self, !finished else {
                         return
@@ -382,7 +573,12 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
     /// - busy: 是否正在处理单帧。
     /// 返回: 不允许将旧结果发布为新草稿的预览。
     private func setBusy(_ busy: Bool) {
-        controls.forEach { $0.isEnabled = !busy }
+        if busy {
+            pausePlayback()
+        }
+        for control in controls {
+            control.isEnabled = !busy
+        }
         table.isEnabled = !busy
         canvas.isEnabled = !busy
     }
@@ -409,26 +605,40 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         dismiss()
     }
 
-    /// 业务作用: 统一结束模态窗口并阻止后台结果再次更新视图。
+    /// 业务作用: 统一关闭框选窗口并阻止后台结果再次更新视图。
     /// 参数说明: 无。
     /// 返回: 归还父窗口操作权，原媒体保持不变。
     private func dismiss() {
+        guard !finished else {
+            return
+        }
         finished = true
+        pausePlayback()
+        if let timeObserver {
+            player.removeTimeObserver(timeObserver)
+            self.timeObserver = nil
+        }
+        player.replaceCurrentItem(with: nil)
         frameTask?.cancel()
         previewTask?.cancel()
-        if let window, let parent = window.sheetParent {
-            parent.endSheet(window)
-        }
-        window?.orderOut(nil)
+        window?.close()
+        onClose?()
     }
 
     /// 业务作用: 将标题栏关闭转为丢弃草稿，与取消按钮保持一致。
     /// 参数说明:
     /// - sender: 发起关闭的窗口。
-    /// 返回: 结束当前 sheet，不触发来源文件操作。
+    /// 返回: 关闭草稿窗口，不触发来源文件操作。
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         dismiss()
         return false
+    }
+
+    /// 业务作用: 父剪辑窗口关闭时同时释放框选播放器和未完成任务。
+    /// 参数说明: 无。
+    /// 返回: 与取消按钮使用同一清理流程。
+    override func close() {
+        dismiss()
     }
 
     /// 业务作用: 为水印列表提供独立时段数。
@@ -461,6 +671,19 @@ enum MovieWatermarkFrame {
     /// - rects: 左上角为原点的比例框。
     /// 返回: 重建后的完整画面；取消或模型失败时抛错。
     static func render(_ image: CGImage, rects: [CGRect]) async throws -> CGImage {
+        try await render(
+            image,
+            regions: rects.map {
+                MovieWatermarkRegion(range: .zero, rect: $0, quality: .detailed)
+            })
+    }
+
+    /// 业务作用: 按各区域的质量档位生成同一帧的补全预览。
+    /// 参数说明:
+    /// - image: 已按来源方向显示的当前帧。
+    /// - regions: 当前帧需要处理的区域及对应质量。
+    /// 返回: 使用与整段处理相同的模型与混合流程，取消或推理失败时抛错。
+    static func render(_ image: CGImage, regions: [MovieWatermarkRegion]) async throws -> CGImage {
         try Task.checkCancellation()
         let size = CGSize(width: image.width, height: image.height)
         let context = CIContext(options: [.cacheIntermediates: false])
@@ -469,11 +692,16 @@ enum MovieWatermarkFrame {
         context.render(
             CIImage(cgImage: image), to: buffer, bounds: bounds,
             colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
-        let model = try MovieInpainter()
-        let pixels = rects.map {
-            MovieWatermarkRegion(range: .zero, rect: $0).pixelRect(size: size, transform: .identity)
+        var output = buffer
+        for quality in MovieInpaintingQuality.allCases {
+            let pixels = regions.filter { $0.quality == quality }.map {
+                $0.pixelRect(size: size, transform: .identity)
+            }
+            if !pixels.isEmpty {
+                let model = try MovieInpainter(quality: quality)
+                output = try model.process(output, rects: pixels)
+            }
         }
-        let output = try model.process(buffer, rects: pixels)
         try Task.checkCancellation()
         guard let result = context.createCGImage(CIImage(cvPixelBuffer: output), from: bounds) else {
             throw RecorderError.message("无法显示补全画面。")
@@ -484,6 +712,7 @@ enum MovieWatermarkFrame {
 
 @MainActor
 final class MovieWatermarkCanvas: NSView {
+    var mediaSize = CGSize.zero
     var image: NSImage? {
         didSet {
             needsDisplay = true
@@ -502,14 +731,17 @@ final class MovieWatermarkCanvas: NSView {
     var isEnabled = true
     var onChange: (() -> Void)?
     private var anchor: NSPoint?
-    override var isFlipped: Bool { true }
+    override var isFlipped: Bool {
+        true
+    }
 
     private var imageRect: CGRect {
-        guard let image, image.size.width > 0, image.size.height > 0 else {
+        let sourceSize = mediaSize == .zero ? (image?.size ?? .zero) : mediaSize
+        guard sourceSize.width > 0, sourceSize.height > 0 else {
             return .zero
         }
-        let scale = min(bounds.width / image.size.width, bounds.height / image.size.height)
-        let size = CGSize(width: image.size.width * scale, height: image.size.height * scale)
+        let scale = min(bounds.width / sourceSize.width, bounds.height / sourceSize.height)
+        let size = CGSize(width: sourceSize.width * scale, height: sourceSize.height * scale)
         return CGRect(
             x: bounds.midX - size.width / 2, y: bounds.midY - size.height / 2, width: size.width,
             height: size.height)
@@ -520,10 +752,12 @@ final class MovieWatermarkCanvas: NSView {
     /// - dirtyRect: 系统要求刷新的范围。
     /// 返回: 留黑区域不属于可选画面，框线不进入补全视频。
     override func draw(_ dirtyRect: NSRect) {
-        NSColor.black.setFill()
-        bounds.fill()
-        image?.draw(
-            in: imageRect, from: .zero, operation: .copy, fraction: 1, respectFlipped: true, hints: nil)
+        if let image {
+            NSColor.black.setFill()
+            bounds.fill()
+            image.draw(
+                in: imageRect, from: .zero, operation: .copy, fraction: 1, respectFlipped: true, hints: nil)
+        }
         guard showsOutline, let rect else {
             return
         }
@@ -582,5 +816,18 @@ final class MovieWatermarkCanvas: NSView {
     /// 返回: 释放后移动鼠标不会继续改变区域。
     override func mouseUp(with event: NSEvent) {
         anchor = nil
+    }
+}
+
+@MainActor
+final class MovieWatermarkWindow: NSWindow {
+    var onEscape: (() -> Void)?
+
+    /// 业务作用: 在画面最大化时让 Escape 先退出全屏，普通窗口才取消编辑。
+    /// 参数说明:
+    /// - sender: 发起取消的响应链对象。
+    /// 返回: 保留全屏编辑中的草稿，避免一次按键丢失框选。
+    override func cancelOperation(_ sender: Any?) {
+        onEscape?()
     }
 }

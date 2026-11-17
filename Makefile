@@ -10,6 +10,7 @@ build: check-signing Resources/AppIcon.icns model
 	cp Resources/Info.plist "$(APP)/Contents/Info.plist"
 	cp Resources/AppIcon.icns "$(APP)/Contents/Resources/AppIcon.icns"
 	ditto .build/LaMa.mlmodelc "$(APP)/Contents/Resources/LaMa.mlmodelc"
+	ditto .build/FastLaMa.mlmodelc "$(APP)/Contents/Resources/FastLaMa.mlmodelc"
 	ditto Resources/ThirdParty "$(APP)/Contents/Resources/ThirdParty"
 	codesign --force --sign "$(SIGN_IDENTITY)" --identifier com.nasa666999.screen-recorder "$(APP)"
 	touch "$(APP)"

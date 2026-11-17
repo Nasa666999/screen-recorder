@@ -866,7 +866,7 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
     /// 参数说明: 无。
     /// 返回: 确认后更新当前片段；取消或来源选择失效时保留原计划。
     @objc private func editWatermarks() {
-        guard !hasWork, let index = selectedIndex, let window else {
+        guard !hasWork, watermarkEditor == nil, let index = selectedIndex, window != nil else {
             return
         }
         player.pause()
@@ -884,11 +884,16 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
                 : "已设置 \(regions.count) 个水印时段。点击“预览全部”检查补全画面与声音，再导出。"
         }
         watermarkEditor = editor
-        if let sheet = editor.window {
-            window.beginSheet(sheet) { [weak self] _ in
-                self?.watermarkEditor = nil
+        editor.onClose = { [weak self] in
+            self?.watermarkEditor = nil
+            self?.refreshControls()
+            if let self, !closed {
+                window?.makeKeyAndOrderFront(nil)
             }
         }
+        refreshControls()
+        editor.showWindow(nil)
+        editor.window?.makeKeyAndOrderFront(nil)
     }
 
     /// 业务作用: 按当前水印与音量设置播放完整计划或接缝，复用与导出相同的媒体处理。
@@ -1228,19 +1233,20 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
     /// 参数说明: 无。
     /// 返回: 无片段、无上一段或无建议时对应动作不可用。
     private func refreshControls() {
+        let available = !hasWork && watermarkEditor == nil
         for control in controls {
-            control.isEnabled = !hasWork
+            control.isEnabled = available
         }
-        table.isEnabled = !hasWork
-        undoButton?.isEnabled = !hasWork && !undoHistory.isEmpty
-        redoButton?.isEnabled = !hasWork && !redoHistory.isEmpty
-        matchButton?.isEnabled = !hasWork && (selectedIndex ?? 0) > 0
-        seamPreviewButton?.isEnabled = !hasWork && (selectedIndex ?? 0) > 0
-        applyButton?.isEnabled = !hasWork && suggestion != nil
-        exportButton?.isEnabled = !hasWork && !clips.isEmpty
-        audioMultiplier.isEnabled = !hasWork && audioAdjustment.indexOfSelectedItem == 4
+        table.isEnabled = available
+        undoButton?.isEnabled = available && !undoHistory.isEmpty
+        redoButton?.isEnabled = available && !redoHistory.isEmpty
+        matchButton?.isEnabled = available && (selectedIndex ?? 0) > 0
+        seamPreviewButton?.isEnabled = available && (selectedIndex ?? 0) > 0
+        applyButton?.isEnabled = available && suggestion != nil
+        exportButton?.isEnabled = available && !clips.isEmpty
+        audioMultiplier.isEnabled = available && audioAdjustment.indexOfSelectedItem == 4
         for control in [startField, endField, startSlider, endSlider] as [NSControl] {
-            control.isEnabled = !hasWork && selectedIndex != nil
+            control.isEnabled = available && selectedIndex != nil
         }
     }
 
@@ -1272,6 +1278,7 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
     /// 返回: 控制器可由应用释放，原文件继续保留。
     func windowWillClose(_ notification: Notification) {
         closed = true
+        watermarkEditor?.close()
         player.pause()
         if let timeObserver {
             player.removeTimeObserver(timeObserver)
