@@ -92,7 +92,7 @@ final class MoviePreview: @unchecked Sendable {
             left.id == right.id && left.source === right.source && left.range == right.range
                 && left.watermarks.count == right.watermarks.count
                 && zip(left.watermarks, right.watermarks).allSatisfy {
-                    $0.id == $1.id && $0.range == $1.range && $0.rect == $1.rect && $0.quality == $1.quality
+                    $0.id == $1.id && $0.range == $1.range && $0.rect == $1.rect
                 }
         }
     }

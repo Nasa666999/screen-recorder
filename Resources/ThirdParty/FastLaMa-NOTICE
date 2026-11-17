@@ -1,8 +1,0 @@
-LaMa: Resolution-robust Large Mask Inpainting with Fourier Convolutions
-Copyright Samsung AI Center / advimman. Licensed under the Apache License, Version 2.0 (LaMa-LICENSE).
-Original project: https://github.com/advimman/lama
-
-The standard inpainting model is the 512 x 512, FLOAT16, 6-bit palettized Core ML conversion
-published by Dadm-n at https://huggingface.co/Dadm-n/lama-dilated-coreml
-(revision 51853822134974a99c9a473175228104f6c97767), distributed under Apache-2.0.
-The model weights are redistributed without modification. The package is compiled into FastLaMa.mlmodelc.

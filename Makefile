@@ -7,10 +7,11 @@ SIGN_IDENTITY ?= Screen Recorder Local Development
 build: check-signing Resources/AppIcon.icns model
 	mkdir -p "$(APP)/Contents/MacOS" "$(APP)/Contents/Resources"
 	xcrun swiftc -swift-version 5 -O -target arm64-apple-macos26.0 -sdk "$(SDK)" -module-cache-path .build/module-cache $(SOURCES) -o "$(APP)/Contents/MacOS/ScreenRecorder"
+	rm -rf "$(APP)/Contents/Resources"
+	mkdir -p "$(APP)/Contents/Resources"
 	cp Resources/Info.plist "$(APP)/Contents/Info.plist"
 	cp Resources/AppIcon.icns "$(APP)/Contents/Resources/AppIcon.icns"
 	ditto .build/LaMa.mlmodelc "$(APP)/Contents/Resources/LaMa.mlmodelc"
-	ditto .build/FastLaMa.mlmodelc "$(APP)/Contents/Resources/FastLaMa.mlmodelc"
 	ditto Resources/ThirdParty "$(APP)/Contents/Resources/ThirdParty"
 	codesign --force --sign "$(SIGN_IDENTITY)" --identifier com.nasa666999.screen-recorder "$(APP)"
 	touch "$(APP)"

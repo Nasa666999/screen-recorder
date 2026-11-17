@@ -2,9 +2,36 @@ import AVFoundation
 import CoreImage
 import CoreML
 
-enum MovieInpaintingQuality: String, CaseIterable, Sendable {
-    case standard
-    case detailed
+enum MovieInpaintingConcurrency: Int, CaseIterable, Sendable {
+    case automatic = 0
+    case single = 1
+    case two = 2
+    case four = 4
+
+    static let preferenceKey = "movieEditor.inpaintingConcurrency"
+
+    /// 业务作用: 在界面区分自动测量与手动任务上限，不提供质量档位。
+    /// 参数说明: 无。
+    /// 返回: 仅描述并发调度方式的菜单文字。
+    var title: String {
+        switch self {
+        case .automatic:
+            return "并发：自动测量"
+        case .single:
+            return "并发：最多 1 路"
+        case .two:
+            return "并发：最多 2 路"
+        case .four:
+            return "并发：最多 4 路"
+        }
+    }
+
+    /// 业务作用: 读取只影响任务调度的偏好，所有并发数使用同一精细模型。
+    /// 参数说明: 无。
+    /// 返回: 未设置或值不受支持时自动测量，不改变画面补全算法。
+    static func selected() -> Self {
+        Self(rawValue: UserDefaults.standard.integer(forKey: preferenceKey)) ?? .automatic
+    }
 }
 
 struct MovieWatermarkRegion: Identifiable, @unchecked Sendable {
@@ -12,19 +39,16 @@ struct MovieWatermarkRegion: Identifiable, @unchecked Sendable {
     var range: CMTimeRange
     // 显示画面的左上角为原点；比例坐标随窗口缩放保持不变。
     var rect: CGRect
-    var quality: MovieInpaintingQuality
 
     /// 业务作用: 保存一个固定位置及其生效时段，允许同一来源分时段更换位置。
     /// 参数说明:
     /// - range: 来源时间线上左闭右开的生效范围。
     /// - rect: 显示画面内的比例矩形，原点在左上角。
-    /// - quality: 标准模式使用较小输入，精细模式保留更大的模型上下文。
     /// 返回: 可随剪切计划复制并撤销的独立区域。
-    init(range: CMTimeRange, rect: CGRect, quality: MovieInpaintingQuality = .standard) {
+    init(range: CMTimeRange, rect: CGRect) {
         id = UUID()
         self.range = range
         self.rect = rect
-        self.quality = quality
     }
 
     /// 业务作用: 阻止越界时间或空白框进入像素处理。
@@ -66,7 +90,6 @@ struct MovieWatermarkRegion: Identifiable, @unchecked Sendable {
 struct MovieWatermarkInterval: @unchecked Sendable {
     let range: CMTimeRange
     let rect: CGRect
-    let quality: MovieInpaintingQuality
 }
 
 struct MovieDecodedFrame: @unchecked Sendable {
@@ -80,19 +103,14 @@ struct MovieProcessedFrame: @unchecked Sendable {
 
 // 每个任务独占模型和输入缓冲，同一任务内按来源顺序处理自己的连续小段。
 final class MovieInpaintingWorker: @unchecked Sendable {
-    private let models: [MovieInpaintingQuality: MovieInpainter]
+    private let model: MovieInpainter
 
     /// 业务作用: 为一个处理任务建立独立模型上下文，避免并发改写模型输入缓冲。
-    /// 参数说明:
-    /// - qualities: 本次计划实际使用的档位。
-    /// 返回: 只加载需要的模型，任意模型不可用时停止本次准备。
-    init(qualities: [MovieInpaintingQuality]) throws {
-        var models: [MovieInpaintingQuality: MovieInpainter] = [:]
-        for quality in qualities {
-            try Task.checkCancellation()
-            models[quality] = try MovieInpainter(quality: quality)
-        }
-        self.models = models
+    /// 参数说明: 无。
+    /// 返回: 加载完整精度模型；资源不可用或已取消时停止准备。
+    init() throws {
+        try Task.checkCancellation()
+        model = try MovieInpainter()
     }
 
     /// 业务作用: 顺序重建分配给本任务的连续帧段，不直接写入公共编码器。
@@ -113,18 +131,29 @@ final class MovieInpaintingWorker: @unchecked Sendable {
             let time = sample.presentationTimeStamp
             let active = intervals.filter { time >= $0.range.start && time < $0.range.end }
             let processed = try autoreleasepool {
-                var output = pixels
-                for quality in MovieInpaintingQuality.allCases {
-                    let rects = active.filter { $0.quality == quality }.map(\.rect)
-                    if !rects.isEmpty, let model = models[quality] {
-                        output = try model.process(output, rects: rects)
-                    }
-                }
-                return output
+                try model.process(pixels, rects: active.map(\.rect))
             }
             result.append(MovieProcessedFrame(pixels: processed, time: time))
         }
         return result
+    }
+
+    /// 业务作用: 用同一帧和完整模型测量调度吞吐量，不发布测量画面。
+    /// 参数说明:
+    /// - frame: 有限缓存内的一个来源画面。
+    /// - rect: 当前计划中的一个真实补全框。
+    /// - count: 本任务顺序执行的测量次数。
+    /// 返回: 测量结束释放中间画面；取消或模型失败时抛错。
+    func measure(_ frame: MovieDecodedFrame, rect: CGRect, count: Int) throws {
+        guard let pixels = frame.sample.imageBuffer else {
+            throw RecorderError.message("来源画面缺少可用像素。")
+        }
+        for _ in 0..<count {
+            try Task.checkCancellation()
+            try autoreleasepool {
+                _ = try model.process(pixels, rects: [rect])
+            }
+        }
     }
 }
 
@@ -191,133 +220,43 @@ final class MovieInpainter {
     private let edge: Int
     private let imageBuffer: CVPixelBuffer
     private let maskBuffer: CVPixelBuffer
-    private let outputName: String
-    private let imageArray: MLMultiArray?
-    private let maskArray: MLMultiArray?
-
-    /// 业务作用: 从应用随附资源加载本地补全模型，不把用户画面发送到网络。
-    /// 参数说明:
-    /// - quality: 本次处理使用的速度与细节档位。
-    /// 返回: 可重复处理有限画面块的模型；资源缺失或格式不符时明确失败。
-    init(quality: MovieInpaintingQuality = .detailed) throws {
-        let resource = quality == .standard ? "FastLaMa" : "LaMa"
-        guard let url = Bundle.main.url(forResource: resource, withExtension: "mlmodelc") else {
+    /// 业务作用: 从应用随附资源加载本地精细补全模型，不把用户画面发送到网络。
+    /// 参数说明: 无。
+    /// 返回: 使用固定的 800×800 全精度模型；资源缺失或格式不符时明确失败。
+    init() throws {
+        guard let url = Bundle.main.url(forResource: "LaMa", withExtension: "mlmodelc") else {
             throw RecorderError.message("应用缺少本地补全模型，请安装包含 LaMa 模型的完整应用。")
         }
         let configuration = MLModelConfiguration()
         configuration.computeUnits = .cpuAndGPU
+        configuration.allowLowPrecisionAccumulationOnGPU = false
         model = try MLModel(contentsOf: url, configuration: configuration)
         let inputs = model.modelDescription.inputDescriptionsByName
-        if let image = inputs["image"]?.imageConstraint,
+        guard let image = inputs["image"]?.imageConstraint,
             let mask = inputs["mask"]?.imageConstraint,
-            image.pixelsWide == image.pixelsHigh, mask.pixelsWide == image.pixelsWide,
-            mask.pixelsHigh == image.pixelsHigh
-        {
-            edge = image.pixelsWide
-            imageBuffer = try Self.buffer(width: edge, height: edge, format: image.pixelFormatType)
-            maskBuffer = try Self.buffer(width: edge, height: edge, format: mask.pixelFormatType)
-            imageArray = nil
-            maskArray = nil
-            outputName = "output"
-        } else if let image = inputs["image"]?.multiArrayConstraint,
-            let mask = inputs["mask"]?.multiArrayConstraint,
-            image.dataType == .float32, mask.dataType == .float32,
-            image.shape == [1, 3, 512, 512], mask.shape == [1, 1, 512, 512]
-        {
-            edge = 512
-            imageBuffer = try Self.buffer(width: edge, height: edge)
-            maskBuffer = try Self.buffer(width: edge, height: edge, format: kCVPixelFormatType_OneComponent8)
-            imageArray = try MLMultiArray(shape: image.shape, dataType: .float32)
-            maskArray = try MLMultiArray(shape: mask.shape, dataType: .float32)
-            outputName = "inpainted_image"
-        } else {
-            throw RecorderError.message("本地补全模型的输入格式不受支持。")
+            image.pixelsWide == 800, image.pixelsHigh == 800,
+            mask.pixelsWide == 800, mask.pixelsHigh == 800
+        else {
+            throw RecorderError.message("本地精细补全模型的输入格式不受支持。")
         }
+        edge = 800
+        imageBuffer = try Self.buffer(width: edge, height: edge, format: image.pixelFormatType)
+        maskBuffer = try Self.buffer(width: edge, height: edge, format: mask.pixelFormatType)
     }
 
-    /// 业务作用: 将同一张局部画面送入对应档位的模型，统一返回可混合的像素缓冲。
+    /// 业务作用: 将完整局部画面与掩码送入精细模型，供预览和视频重建共同使用。
     /// 参数说明: 无。
-    /// 返回: 标准档转换张量输入输出，精细档直接使用图像；非有限输出明确拒绝。
+    /// 返回: 可立即混合的模型输出；模型未产生图像时明确失败。
     private func predict() throws -> CVPixelBuffer {
-        let features: MLDictionaryFeatureProvider
-        if let imageArray, let maskArray {
-            try encode(image: imageArray, mask: maskArray)
-            features = try MLDictionaryFeatureProvider(dictionary: [
-                "image": MLFeatureValue(multiArray: imageArray),
-                "mask": MLFeatureValue(multiArray: maskArray),
-            ])
-        } else {
-            features = try MLDictionaryFeatureProvider(dictionary: [
-                "image": MLFeatureValue(pixelBuffer: imageBuffer),
-                "mask": MLFeatureValue(pixelBuffer: maskBuffer),
-            ])
-        }
+        let features = try MLDictionaryFeatureProvider(dictionary: [
+            "image": MLFeatureValue(pixelBuffer: imageBuffer),
+            "mask": MLFeatureValue(pixelBuffer: maskBuffer),
+        ])
         let prediction = try model.prediction(from: features)
-        if let result = prediction.featureValue(for: outputName)?.imageBufferValue {
-            return result
-        }
-        guard let values = prediction.featureValue(for: outputName)?.multiArrayValue,
-            values.dataType == .float32, values.shape == [1, 3, NSNumber(value: edge), NSNumber(value: edge)]
-        else {
+        guard let result = prediction.featureValue(for: "output")?.imageBufferValue else {
             throw RecorderError.message("本地补全模型没有产生可用画面。")
         }
-        guard CVPixelBufferLockBaseAddress(imageBuffer, []) == kCVReturnSuccess else {
-            throw RecorderError.message("无法读取补全画面缓冲。")
-        }
-        defer {
-            CVPixelBufferUnlockBaseAddress(imageBuffer, [])
-        }
-        let pixels = CVPixelBufferGetBaseAddress(imageBuffer)!.assumingMemoryBound(to: UInt8.self)
-        let data = values.dataPointer.assumingMemoryBound(to: Float.self)
-        let strides = values.strides.map(\.intValue)
-        for y in 0..<edge {
-            for x in 0..<edge {
-                let offset = y * CVPixelBufferGetBytesPerRow(imageBuffer) + x * 4
-                for channel in 0..<3 {
-                    let value = data[channel * strides[1] + y * strides[2] + x * strides[3]]
-                    guard value.isFinite else {
-                        throw RecorderError.message("模型产生了无效颜色，当前画面未保存。")
-                    }
-                    pixels[offset + 2 - channel] = UInt8((min(1, max(0, value)) * 255).rounded())
-                }
-                pixels[offset + 3] = 255
-            }
-        }
-        return imageBuffer
-    }
-
-    /// 业务作用: 将局部 BGRA 图像与二值掩码转换为标准模型要求的平面 RGB 张量。
-    /// 参数说明:
-    /// - image: 连续存放的三通道浮点输入。
-    /// - mask: 连续存放的单通道浮点掩码。
-    /// 返回: 颜色归一化到零至一，掩码一表示需要重建；缓冲不可访问时抛错。
-    private func encode(image: MLMultiArray, mask: MLMultiArray) throws {
-        guard CVPixelBufferLockBaseAddress(imageBuffer, .readOnly) == kCVReturnSuccess else {
-            throw RecorderError.message("无法读取模型输入画面。")
-        }
-        defer {
-            CVPixelBufferUnlockBaseAddress(imageBuffer, .readOnly)
-        }
-        guard CVPixelBufferLockBaseAddress(maskBuffer, .readOnly) == kCVReturnSuccess else {
-            throw RecorderError.message("无法读取模型输入掩码。")
-        }
-        defer {
-            CVPixelBufferUnlockBaseAddress(maskBuffer, .readOnly)
-        }
-        let pixels = CVPixelBufferGetBaseAddress(imageBuffer)!.assumingMemoryBound(to: UInt8.self)
-        let holes = CVPixelBufferGetBaseAddress(maskBuffer)!.assumingMemoryBound(to: UInt8.self)
-        let colors = image.dataPointer.assumingMemoryBound(to: Float.self)
-        let flags = mask.dataPointer.assumingMemoryBound(to: Float.self)
-        for y in 0..<edge {
-            for x in 0..<edge {
-                let offset = y * CVPixelBufferGetBytesPerRow(imageBuffer) + x * 4
-                let index = y * edge + x
-                for channel in 0..<3 {
-                    colors[channel * edge * edge + index] = Float(pixels[offset + 2 - channel]) / 255
-                }
-                flags[index] = holes[y * CVPixelBufferGetBytesPerRow(maskBuffer) + x] > 127 ? 1 : 0
-            }
-        }
+        return result
     }
 
     /// 业务作用: 创建可由 Core Image 与 Core ML 共用的有限像素缓冲。
@@ -439,6 +378,60 @@ final class MovieInpainter {
 }
 
 enum MovieWatermarkProcessor {
+    /// 业务作用: 为连续帧段分配独立模型，自动模式按本机实测吞吐量选择并发数。
+    /// 参数说明:
+    /// - concurrency: 用户指定的调度方式，不影响模型、精度或逐帧算法。
+    /// - maximum: 由像素缓存、物理内存和处理器数量共同限制的任务上限。
+    /// - duration: 短视频省略测量，避免测量时间超过处理收益。
+    /// - frame: 所有候选并发数共用的测量画面。
+    /// - rect: 所有候选共用的真实补全位置。
+    /// - progress: 模型加载与吞吐量测量的用户说明。
+    /// 返回: 独立模型任务，执行自动测量时已预热；测量画面不进入输出，取消或模型失败时抛错。
+    private static func selectWorkers(
+        concurrency: MovieInpaintingConcurrency, maximum: Int, duration: CMTime,
+        frame: MovieDecodedFrame, rect: CGRect,
+        progress: @escaping @Sendable (Double, String) -> Void
+    ) async throws -> [MovieInpaintingWorker] {
+        let automatic = concurrency == .automatic
+        let limit = automatic ? (duration.seconds >= 30 ? maximum : 1) : min(maximum, concurrency.rawValue)
+        let candidates = [1, 2, 4].filter { $0 <= limit }
+        let count = automatic ? candidates.last! : limit
+        let workers = try (0..<count).map { _ in
+            try MovieInpaintingWorker()
+        }
+        guard automatic, count > 1 else {
+            return workers
+        }
+        progress(0, "正在测量精细补全并发数…")
+        // 先预热每个独立模型，再以相同画面和相同总工作量比较，避免冷启动偏向某一路。
+        for worker in workers {
+            try worker.measure(frame, rect: rect, count: 1)
+        }
+        var selected = 1
+        var best = Double.infinity
+        for lanes in candidates {
+            try Task.checkCancellation()
+            let began = Date()
+            try await withThrowingTaskGroup(of: Void.self) { group in
+                for index in 0..<lanes {
+                    let worker = workers[index]
+                    group.addTask {
+                        try worker.measure(frame, rect: rect, count: count / lanes)
+                    }
+                }
+                try await group.waitForAll()
+            }
+            let elapsed = Date().timeIntervalSince(began)
+            // 共享 GPU 可能使更多任务更慢；只有超过测量波动的收益才增加并发。
+            if elapsed < best * 0.9 {
+                best = elapsed
+                selected = lanes
+            }
+            progress(0, "正在测量精细补全并发数 · \(lanes) 路 · \(String(format: "%.1f", Double(count) / elapsed)) 帧/秒")
+        }
+        return Array(workers.prefix(selected))
+    }
+
     /// 业务作用: 将来源时间上的框映射到拼接时间线，只处理当前保留片段内的交集。
     /// 参数说明:
     /// - clips: 已排序、可包含剪切和分割的片段。
@@ -455,8 +448,7 @@ enum MovieWatermarkProcessor {
                             range: CMTimeRange(
                                 start: cursor + overlap.start - clip.range.start, duration: overlap.duration),
                             rect: region.pixelRect(
-                                size: clip.source.info.size, transform: clip.source.info.transform),
-                            quality: region.quality))
+                                size: clip.source.info.size, transform: clip.source.info.transform)))
                 }
             }
             cursor = cursor + clip.range.duration
@@ -481,9 +473,7 @@ enum MovieWatermarkProcessor {
         }
         try Task.checkCancellation()
         progress(0, "正在加载本地画面补全模型…")
-        let qualities = MovieInpaintingQuality.allCases.filter { quality in
-            entries.contains { $0.quality == quality }
-        }
+        let concurrency = MovieInpaintingConcurrency.selected()
         let duration = try await composition.load(.duration)
         guard let track = try await composition.loadTracks(withMediaType: .video).first else {
             throw RecorderError.message("没有可补全的视频轨道。")
@@ -512,14 +502,8 @@ enum MovieWatermarkProcessor {
         // 帧缓存预算同时计入输入、输出和一个预取帧；模型工作内存不计入这个像素预算。
         let bytesPerFrame = max(1, Int(size.width) * Int(size.height) * 4)
         let frameBudget = max(1, (192 * 1024 * 1024 / bytesPerFrame - 1) / 2)
-        let parallel =
-            qualities == [.standard] && frameBudget >= 2
-            && ProcessInfo.processInfo.physicalMemory >= 12 * 1024 * 1024 * 1024
-        let laneCount = parallel ? 2 : 1
-        let batchSize = min(4, max(1, frameBudget / laneCount))
-        let workers = try (0..<laneCount).map { _ in
-            try MovieInpaintingWorker(qualities: qualities)
-        }
+        let memoryLanes = max(1, Int(ProcessInfo.processInfo.physicalMemory / (4 * 1024 * 1024 * 1024)))
+        let maximumLanes = min(4, frameBudget, memoryLanes, ProcessInfo.processInfo.activeProcessorCount)
         let reader = try AVAssetReader(asset: composition)
         reader.timeRange = CMTimeRange(start: .zero, duration: duration)
         let output = AVAssetReaderTrackOutput(
@@ -580,6 +564,18 @@ enum MovieWatermarkProcessor {
         defer {
             decoder.cancel()
         }
+        var pendingFirst = try await decoder.next()
+        let workers: [MovieInpaintingWorker]
+        do {
+            guard let first = pendingFirst else {
+                throw reader.error ?? RecorderError.message("来源视频没有可用画面。")
+            }
+            workers = try await selectWorkers(
+                concurrency: concurrency, maximum: maximumLanes, duration: duration,
+                frame: MovieDecodedFrame(sample: first), rect: entries[0].rect, progress: progress)
+        }
+        let laneCount = workers.count
+        let batchSize = min(4, max(1, frameBudget / laneCount))
         let began = Date()
         var previous = CMTime.invalid
         var frames = 0
@@ -589,7 +585,14 @@ enum MovieWatermarkProcessor {
             for _ in 0..<laneCount {
                 var batch: [MovieDecodedFrame] = []
                 for _ in 0..<batchSize {
-                    guard let sample = try await decoder.next() else {
+                    let next: CMSampleBuffer?
+                    if let first = pendingFirst {
+                        next = first
+                        pendingFirst = nil
+                    } else {
+                        next = try await decoder.next()
+                    }
+                    guard let sample = next else {
                         exhausted = true
                         break
                     }

@@ -25,7 +25,7 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
     private let table = NSTableView()
     private let start = NSTextField()
     private let end = NSTextField()
-    private let quality = NSPopUpButton()
+    private let concurrency = NSPopUpButton()
     private let slider = NSSlider()
     private let position = NSTextField(labelWithString: "")
     private let status = NSTextField(wrappingLabelWithString: "在画面上拖框，包含完整水印和少量边缘，再保存生效时段。")
@@ -183,11 +183,14 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
             button("预览当前帧", action: #selector(previewFrame)),
             button("显示原画面", action: #selector(restoreOriginal)),
         ])
-        quality.addItems(withTitles: ["标准（较快）", "精细（较慢）"])
-        quality.setAccessibilityLabel("画面补全质量")
-        quality.toolTip = "标准使用较小模型输入提高速度；复杂纹理可切换精细，并先比较当前帧。两种模式都处理每一帧。"
-        controls.append(quality)
-        actions.addArrangedSubview(quality)
+        concurrency.addItems(withTitles: MovieInpaintingConcurrency.allCases.map(\.title))
+        concurrency.selectItem(at: MovieInpaintingConcurrency.allCases.firstIndex(of: .selected()) ?? 0)
+        concurrency.setAccessibilityLabel("精细补全并发数")
+        concurrency.toolTip = "所有选项均使用相同的精细模型。自动模式在长视频开始前测量吞吐量；手动并发数受内存预算限制，更多任务不一定更快。"
+        concurrency.target = self
+        concurrency.action = #selector(changeConcurrency)
+        controls.append(concurrency)
+        actions.addArrangedSubview(concurrency)
         actions.spacing = 8
         root.addArrangedSubview(actions)
         compactViews.append(actions)
@@ -226,6 +229,14 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         slider.widthAnchor.constraint(greaterThanOrEqualToConstant: 100).isActive = true
     }
 
+    /// 业务作用: 保存下一次预览或导出的并发偏好，不改变时段草稿或补全效果。
+    /// 参数说明: 无。
+    /// 返回: 当前任务继续使用启动时的快照，后续任务读取新偏好。
+    @objc private func changeConcurrency() {
+        let selected = MovieInpaintingConcurrency.allCases[concurrency.indexOfSelectedItem]
+        UserDefaults.standard.set(selected.rawValue, forKey: MovieInpaintingConcurrency.preferenceKey)
+    }
+
     /// 业务作用: 把输入字段和当前框解析为可执行的补全时段。
     /// 参数说明: 无。
     /// 返回: 完整有效的草稿；未框选或越界时给出明确错误。
@@ -239,7 +250,6 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         var result = editing.map { regions[$0] } ?? MovieWatermarkRegion(range: range, rect: rect)
         result.range = range
         result.rect = rect
-        result.quality = quality.indexOfSelectedItem == 0 ? .standard : .detailed
         try result.validate(within: clip.source.info.bounds)
         return result
     }
@@ -299,7 +309,6 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         editing = nil
         table.deselectAll(nil)
         canvas.rect = nil
-        quality.selectItem(at: 0)
         start.stringValue = MovieTime.string(lower)
         end.stringValue = MovieTime.string(clip.range.end)
         // 毫秒文本仅用于显示；未修改的来源末端在解析时恢复为真实边界。
@@ -319,7 +328,6 @@ final class MovieWatermarkController: NSWindowController, NSTableViewDataSource,
         start.stringValue = MovieTime.string(region.range.start)
         end.stringValue = MovieTime.string(region.range.end)
         canvas.rect = region.rect
-        quality.selectItem(at: region.quality == .standard ? 0 : 1)
         slider.doubleValue = min(
             clip.range.end.seconds, max(clip.range.start.seconds, region.range.start.seconds))
         loadFrame()
@@ -674,14 +682,14 @@ enum MovieWatermarkFrame {
         try await render(
             image,
             regions: rects.map {
-                MovieWatermarkRegion(range: .zero, rect: $0, quality: .detailed)
+                MovieWatermarkRegion(range: .zero, rect: $0)
             })
     }
 
-    /// 业务作用: 按各区域的质量档位生成同一帧的补全预览。
+    /// 业务作用: 使用与整段处理相同的精细模型生成当前帧预览。
     /// 参数说明:
     /// - image: 已按来源方向显示的当前帧。
-    /// - regions: 当前帧需要处理的区域及对应质量。
+    /// - regions: 当前帧需要处理的区域。
     /// 返回: 使用与整段处理相同的模型与混合流程，取消或推理失败时抛错。
     static func render(_ image: CGImage, regions: [MovieWatermarkRegion]) async throws -> CGImage {
         try Task.checkCancellation()
@@ -692,16 +700,11 @@ enum MovieWatermarkFrame {
         context.render(
             CIImage(cgImage: image), to: buffer, bounds: bounds,
             colorSpace: CGColorSpace(name: CGColorSpace.sRGB)!)
-        var output = buffer
-        for quality in MovieInpaintingQuality.allCases {
-            let pixels = regions.filter { $0.quality == quality }.map {
-                $0.pixelRect(size: size, transform: .identity)
-            }
-            if !pixels.isEmpty {
-                let model = try MovieInpainter(quality: quality)
-                output = try model.process(output, rects: pixels)
-            }
+        let pixels = regions.map {
+            $0.pixelRect(size: size, transform: .identity)
         }
+        let model = try MovieInpainter()
+        let output = try model.process(buffer, rects: pixels)
         try Task.checkCancellation()
         guard let result = context.createCGImage(CIImage(cvPixelBuffer: output), from: bounds) else {
             throw RecorderError.message("无法显示补全画面。")
