@@ -7,6 +7,11 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
     NSTableViewDelegate, NSTextFieldDelegate, NSMenuDelegate
 {
     var onChange: (() -> Void)?
+    var onOpenImage: (() -> Void)? {
+        didSet {
+            refreshControls()
+        }
+    }
     private(set) var hasWork = false
     private(set) var closed = false
     private var clips: [MovieClip] = []
@@ -37,6 +42,17 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
     private let rightImage = NSImageView()
     private let progress = NSProgressIndicator()
     private let audioAdjustment = NSPopUpButton()
+    private let watermarkActions = NSPopUpButton(frame: .zero, pullsDown: true)
+    private let videoWatermarkItem = NSMenuItem(
+        title: "视频分时段去水印…",
+        action: nil,
+        keyEquivalent: ""
+    )
+    private let imageWatermarkItem = NSMenuItem(
+        title: "图片去水印…",
+        action: nil,
+        keyEquivalent: ""
+    )
     private let audioMultiplier = NSTextField(string: "4")
     private var controls: [NSControl] = []
     private var undoButton: NSButton!
@@ -139,9 +155,19 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
         let heading = NSTextField(labelWithString: "片段 · 按列表顺序拼接")
         heading.font = .systemFont(ofSize: 14, weight: .semibold)
         sidebar.addArrangedSubview(heading)
+        watermarkActions.addItem(withTitle: "去水印…")
+        watermarkActions.menu?.autoenablesItems = false
+        videoWatermarkItem.target = self
+        videoWatermarkItem.action = #selector(editWatermarks)
+        imageWatermarkItem.target = self
+        imageWatermarkItem.action = #selector(openImageWatermarks)
+        watermarkActions.menu?.addItem(videoWatermarkItem)
+        watermarkActions.menu?.addItem(imageWatermarkItem)
+        watermarkActions.toolTip = "对所选视频分时段去水印，或打开图片进行多区域补全。"
+        controls.append(watermarkActions)
         let imports = NSStackView(views: [
             button("添加视频…", action: #selector(chooseFiles)),
-            button("分时段去水印…", action: #selector(editWatermarks)),
+            watermarkActions,
         ])
         imports.spacing = 8
         sidebar.addArrangedSubview(imports)
@@ -865,6 +891,17 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
         preview(clips, seam: nil)
     }
 
+    /// 业务作用: 从剪辑窗口打开独立图片补全入口，沿用应用的来源选择和任务生命周期。
+    /// 参数说明: 无。
+    /// 返回: 不要求存在视频片段，不改变当前剪辑计划。
+    @objc private func openImageWatermarks() {
+        guard !hasWork, watermarkEditor == nil, !closed else {
+            return
+        }
+        player.pause()
+        onOpenImage?()
+    }
+
     /// 业务作用: 为选中片段打开可拖框的分时段水印设置，将确认结果纳入撤销历史。
     /// 参数说明: 无。
     /// 返回: 确认后更新当前片段；取消或来源选择失效时保留原计划。
@@ -1240,6 +1277,10 @@ final class MovieEditorController: NSWindowController, NSWindowDelegate, NSTable
         for control in controls {
             control.isEnabled = available
         }
+        videoWatermarkItem.isEnabled = available && selectedIndex != nil
+        videoWatermarkItem.title =
+            selectedIndex == nil ? "视频分时段去水印…（先选片段）" : "视频分时段去水印…"
+        imageWatermarkItem.isEnabled = available && onOpenImage != nil
         table.isEnabled = available
         undoButton?.isEnabled = available && !undoHistory.isEmpty
         redoButton?.isEnabled = available && !redoHistory.isEmpty

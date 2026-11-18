@@ -749,6 +749,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
             closeToolbar()
         }
         let editor = MovieEditorController()
+        editor.onOpenImage = { [weak self] in
+            self?.openImage()
+        }
         editor.onChange = { [weak self] in
             self?.editors.removeAll { $0.closed && !$0.hasWork }
             self?.finishQuitIfPossible()
