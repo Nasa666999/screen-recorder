@@ -18,3 +18,6 @@ jobs:
           codesign --verify --strict "build/Screen Recorder.app"
           plutil -lint "build/Screen Recorder.app/Contents/Info.plist"
           test -s "build/Screen Recorder.app/Contents/Resources/AppIcon.icns"
+          test -d "build/Screen Recorder.app/Contents/Resources/LaMa.mlmodelc"
+          test -d "build/Screen Recorder.app/Contents/Resources/LocalLaMa.mlmodelc"
+          test -s "build/Screen Recorder.app/Contents/Resources/ThirdParty/LaMa-NOTICE"

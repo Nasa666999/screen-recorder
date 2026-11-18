@@ -138,7 +138,7 @@ final class MovieInpaintingWorker: @unchecked Sendable {
         return result
     }
 
-    /// 业务作用: 用同一帧和完整模型测量调度吞吐量，不发布测量画面。
+    /// 业务作用: 用同一帧和当前精细补全路径测量调度吞吐量，不发布测量画面。
     /// 参数说明:
     /// - frame: 有限缓存内的一个来源画面。
     /// - rect: 当前计划中的一个真实补全框。
@@ -220,6 +220,9 @@ final class MovieInpainter {
     private let edge: Int
     private let imageBuffer: CVPixelBuffer
     private let maskBuffer: CVPixelBuffer
+    private let localURL: URL?
+    private var localModel: MLModel?
+    private var localOrigin: MLMultiArray?
     /// 业务作用: 从应用随附资源加载本地精细补全模型，不把用户画面发送到网络。
     /// 参数说明: 无。
     /// 返回: 使用固定的 800×800 全精度模型；资源缺失或格式不符时明确失败。
@@ -242,21 +245,122 @@ final class MovieInpainter {
         edge = 800
         imageBuffer = try Self.buffer(width: edge, height: edge, format: image.pixelFormatType)
         maskBuffer = try Self.buffer(width: edge, height: edge, format: mask.pixelFormatType)
+        localURL = Bundle.main.url(forResource: "LocalLaMa", withExtension: "mlmodelc")
     }
 
-    /// 业务作用: 将完整局部画面与掩码送入精细模型，供预览和视频重建共同使用。
-    /// 参数说明: 无。
-    /// 返回: 可立即混合的模型输出；模型未产生图像时明确失败。
-    private func predict() throws -> CVPixelBuffer {
-        let features = try MLDictionaryFeatureProvider(dictionary: [
+    /// 业务作用: 将完整输入与全局特征保留，只省去不会影响选区的末端重建计算。
+    /// 参数说明:
+    /// - maskRect: 八百像素模型输入中的左下角掩码位置。
+    /// - scale: 来源像素映射到模型输入的比例，用于保留羽化与采样边缘。
+    /// 返回: 保持八百像素输出栅格的模型画面；范围不足时执行完整重建。
+    private func predict(maskRect: CGRect, scale: CGFloat) throws -> CVPixelBuffer {
+        var values = [
             "image": MLFeatureValue(pixelBuffer: imageBuffer),
             "mask": MLFeatureValue(pixelBuffer: maskBuffer),
-        ])
-        let prediction = try model.prediction(from: features)
+        ]
+        let selected: MLModel
+        let position: (top: Int, left: Int)?
+        if let localURL, let window = localWindow(maskRect: maskRect, scale: scale) {
+            if localModel == nil {
+                let configuration = MLModelConfiguration()
+                configuration.computeUnits = .cpuAndGPU
+                configuration.allowLowPrecisionAccumulationOnGPU = false
+                let loaded = try MLModel(contentsOf: localURL, configuration: configuration)
+                guard
+                    loaded.modelDescription.inputDescriptionsByName["image"]?.imageConstraint?.pixelsWide
+                        == 800,
+                    loaded.modelDescription.inputDescriptionsByName["mask"]?.imageConstraint?.pixelsHigh
+                        == 800,
+                    loaded.modelDescription.outputDescriptionsByName["output"]?.imageConstraint?.pixelsWide
+                        == 384,
+                    loaded.modelDescription.outputDescriptionsByName["output"]?.imageConstraint?.pixelsHigh
+                        == 384
+                else {
+                    throw RecorderError.message("局部重建模型的输入或输出格式不受支持。")
+                }
+                let position = try MLMultiArray(shape: [2], dataType: .int32)
+                localModel = loaded
+                localOrigin = position
+            }
+            localOrigin![0] = NSNumber(value: window.top)
+            localOrigin![1] = NSNumber(value: window.left)
+            values["origin"] = MLFeatureValue(multiArray: localOrigin!)
+            selected = localModel!
+            position = (window.top, window.left)
+        } else {
+            // 任何所需像素超出安全窗口时保留完整末端，不能以缺少依赖边缘换取速度。
+            selected = model
+            position = nil
+        }
+        let features = try MLDictionaryFeatureProvider(dictionary: values)
+        let prediction = try selected.prediction(from: features)
         guard let result = prediction.featureValue(for: "output")?.imageBufferValue else {
             throw RecorderError.message("本地补全模型没有产生可用画面。")
         }
+        if let position {
+            return try placeLocal(result, top: position.top * 8, left: position.left * 8)
+        }
         return result
+    }
+
+    /// 业务作用: 把局部输出放回完整模型栅格，保持原有像素采样相位与混合变换。
+    /// 参数说明:
+    /// - pixels: 本次局部重建的独立输出。
+    /// - top: 完整模型画面内从顶部开始的像素行。
+    /// - left: 完整模型画面内从左侧开始的像素列。
+    /// 返回: 当前任务独占的完整栅格；像素不可读写或格式不一致时停止本帧。
+    private func placeLocal(_ pixels: CVPixelBuffer, top: Int, left: Int) throws -> CVPixelBuffer {
+        guard CVPixelBufferGetWidth(pixels) == 384, CVPixelBufferGetHeight(pixels) == 384,
+            CVPixelBufferGetPixelFormatType(pixels) == kCVPixelFormatType_32BGRA,
+            CVPixelBufferLockBaseAddress(pixels, .readOnly) == kCVReturnSuccess
+        else {
+            throw RecorderError.message("无法读取局部重建像素。")
+        }
+        defer {
+            CVPixelBufferUnlockBaseAddress(pixels, .readOnly)
+        }
+        guard CVPixelBufferLockBaseAddress(imageBuffer, []) == kCVReturnSuccess else {
+            throw RecorderError.message("无法写入完整补全栅格。")
+        }
+        defer {
+            CVPixelBufferUnlockBaseAddress(imageBuffer, [])
+        }
+        guard let source = CVPixelBufferGetBaseAddress(pixels),
+            let target = CVPixelBufferGetBaseAddress(imageBuffer)
+        else {
+            throw RecorderError.message("补全栅格缺少可访问的像素。")
+        }
+        for row in 0..<384 {
+            memcpy(
+                target.advanced(by: (top + row) * CVPixelBufferGetBytesPerRow(imageBuffer) + left * 4),
+                source.advanced(by: row * CVPixelBufferGetBytesPerRow(pixels)), 384 * 4)
+        }
+        return imageBuffer
+    }
+
+    /// 业务作用: 为局部重建选择对齐八像素的窗口，并验证全部选区依赖都在其中。
+    /// 参数说明:
+    /// - maskRect: 完整模型输入中的掩码范围。
+    /// - scale: 来源与模型的像素比例。
+    /// 返回: 可保真处理时返回模型网格位置及左下角原点，否则要求完整重建。
+    private func localWindow(maskRect: CGRect, scale: CGFloat) -> (top: Int, left: Int, origin: CGPoint)? {
+        let full = CGRect(x: 0, y: 0, width: 800, height: 800)
+        let left = min(52, max(0, Int(((maskRect.midX - 192) / 8).rounded())))
+        let top = min(52, max(0, Int(((800 - maskRect.midY - 192) / 8).rounded())))
+        let origin = CGPoint(x: left * 8, y: 800 - top * 8 - 384)
+        let window = CGRect(origin: origin, size: CGSize(width: 384, height: 384))
+        // 三层步长二的三像素转置卷积与七像素输出卷积具有有限依赖，保留三十二像素边缘。
+        // 与完整画面重合的边界沿用同一反射填充，内部新边界则不能影响任何混合采样。
+        let safe = CGRect(
+            x: window.minX == 0 ? 0 : window.minX + 32,
+            y: window.minY == 0 ? 0 : window.minY + 32,
+            width: window.width - (window.minX == 0 ? 0 : 32) - (window.maxX == 800 ? 0 : 32),
+            height: window.height - (window.minY == 0 ? 0 : 32) - (window.maxY == 800 ? 0 : 32))
+        let required = maskRect.insetBy(dx: -2 * scale - 2, dy: -2 * scale - 2).intersection(full)
+        guard safe.contains(required) else {
+            return nil
+        }
+        return (top, left, origin)
     }
 
     /// 业务作用: 创建可由 Core Image 与 Core ML 共用的有限像素缓冲。
@@ -311,7 +415,7 @@ final class MovieInpainter {
             let extent = CGRect(x: 0, y: 0, width: edge, height: edge)
             context.render(patch, to: imageBuffer, bounds: extent, colorSpace: colorSpace)
             context.render(mask, to: maskBuffer, bounds: extent, colorSpace: colorSpace)
-            let generated = try predict()
+            let generated = try predict(maskRect: maskRect, scale: scale)
             let restored = CIImage(cvPixelBuffer: generated)
                 .transformed(by: CGAffineTransform(scaleX: 1 / scale, y: 1 / scale))
                 .transformed(by: CGAffineTransform(translationX: crop.minX, y: crop.minY))

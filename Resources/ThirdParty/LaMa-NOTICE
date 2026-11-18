@@ -3,7 +3,8 @@ Copyright Samsung AI Center / advimman. Licensed under the Apache License, Versi
 Original code and weights: https://github.com/advimman/lama — weights "big-lama" from
 https://huggingface.co/smartywu/big-lama (the download the official README points to).
 
-This repository redistributes a Core ML conversion of big-lama (LaMa.mlpackage). The package
-was published without a licence statement at huggingface.co/jerhoads/lama-coreml (commit
-da9859ec149712a4bba6dfb2946f097b026bc8ec); its weights were verified here to be big-lama
-(see README.md and verify_against_official.py). The files are unmodified.
+Core ML source package:
+https://huggingface.co/arraypress/erase-lama/tree/ef3cdb380b3978f25ec5371b42c0dbbb2f4e5fed
+
+应用打包完整模型及其局部重建派生模型。来源模型包保持不变；派生程序保留完整输入、
+傅里叶全局特征和全精度参数，只缩小末端局部卷积的输出范围。两种模型均受上述 Apache-2.0 许可约束。

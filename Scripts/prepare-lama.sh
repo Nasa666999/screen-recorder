@@ -1,5 +1,6 @@
 #!/bin/bash
 set -euo pipefail
+model_python="${1:-/usr/bin/python3}"
 
 source=.build/LaMa.mlpackage
 compiled=.build/LaMa.mlmodelc
@@ -33,4 +34,25 @@ if [ ! -d "$compiled" ] \
     || [ "$source/Data/com.apple.CoreML/model.mlmodel" -nt "$compiled" ] \
     || [ "$source/Data/com.apple.CoreML/weights/weight.bin" -nt "$compiled" ]; then
     .build/compile-lama "$source" "$compiled"
+fi
+if [ ! -x .build/model-tools/bin/python ]; then
+    "$model_python" -m venv .build/model-tools
+fi
+if [ ! -f .build/model-tools/requirements-ready ] \
+    || [ Scripts/model-tools-requirements.txt -nt .build/model-tools/requirements-ready ]; then
+    .build/model-tools/bin/python -m pip install --disable-pip-version-check --no-cache-dir -r Scripts/model-tools-requirements.txt
+    touch .build/model-tools/requirements-ready
+fi
+if [ ! -d .build/LocalLaMa.mlpackage ] \
+    || [ Scripts/prepare-local-lama.py -nt .build/LocalLaMa.mlpackage ] \
+    || [ Scripts/model-tools-requirements.txt -nt .build/LocalLaMa.mlpackage ] \
+    || [ "$source/Data/com.apple.CoreML/model.mlmodel" -nt .build/LocalLaMa.mlpackage ] \
+    || [ "$source/Data/com.apple.CoreML/weights/weight.bin" -nt .build/LocalLaMa.mlpackage ]; then
+    .build/model-tools/bin/python Scripts/prepare-local-lama.py "$source" .build/LocalLaMa.mlpackage
+fi
+if [ ! -d .build/LocalLaMa.mlmodelc ] \
+    || [ Scripts/compile-lama.swift -nt .build/LocalLaMa.mlmodelc ] \
+    || [ .build/LocalLaMa.mlpackage/Data/com.apple.CoreML/model.mlmodel -nt .build/LocalLaMa.mlmodelc ] \
+    || [ .build/LocalLaMa.mlpackage/Data/com.apple.CoreML/weights/weight.bin -nt .build/LocalLaMa.mlmodelc ]; then
+    .build/compile-lama .build/LocalLaMa.mlpackage .build/LocalLaMa.mlmodelc
 fi

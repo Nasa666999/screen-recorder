@@ -1,6 +1,7 @@
 import AVFoundation
 import AppKit
 import ScreenCaptureKit
+import UniformTypeIdentifiers
 
 @MainActor
 final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
@@ -24,6 +25,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var sourceRequest: UUID?
     private var artifacts: [ArtifactController] = []
     private var editors: [MovieEditorController] = []
+    private var imageEditors: [ImageWatermarkController] = []
     private var observers: [NSObjectProtocol] = []
     private var keyMonitor: Any?
     private var invocationAvailable = false
@@ -54,6 +56,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         )
         editItem.target = self
         applicationMenu.addItem(editItem)
+        let imageItem = applicationMenu.addItem(
+            withTitle: "图片去水印…", action: #selector(openImage), keyEquivalent: "")
+        imageItem.target = self
         applicationMenu.addItem(.separator())
         let quitItem = NSMenuItem(
             title: "退出 Screen Recorder",
@@ -398,6 +403,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 keyEquivalent: "")
             menu.addItem(withTitle: "重试注册调用快捷键", action: #selector(retryHotKey), keyEquivalent: "")
             menu.addItem(withTitle: "剪辑与拼接…", action: #selector(openEditor), keyEquivalent: "o")
+            menu.addItem(withTitle: "图片去水印…", action: #selector(openImage), keyEquivalent: "")
             menu.addItem(.separator())
             menu.addItem(withTitle: "退出 Screen Recorder", action: #selector(quit), keyEquivalent: "q")
             for item in menu.items {
@@ -690,6 +696,47 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         presentEditor(urls: [])
     }
 
+    /// 业务作用: 主动选择静态图片，进入独立的多区域去水印窗口。
+    /// 参数说明: 无。
+    /// 返回: 取消选择不读取图片，视频录制与剪辑计划不改变。
+    @objc private func openImage() {
+        guard !quitting else {
+            return
+        }
+        let picker = NSOpenPanel()
+        picker.allowedContentTypes = [.png, .jpeg, .heic, .tiff]
+        picker.canChooseFiles = true
+        picker.canChooseDirectories = false
+        picker.allowsMultipleSelection = true
+        picker.prompt = "打开图片"
+        NSApp.activate(ignoringOtherApps: true)
+        if picker.runModal() == .OK {
+            for url in picker.urls {
+                presentImage(url: url)
+            }
+        }
+    }
+
+    /// 业务作用: 持有图片窗口直到后台处理和保存清理完毕。
+    /// 参数说明:
+    /// - url: 用户明确选择的图片来源。
+    /// 返回: 原图片保持不变，退出应用时等待当前图片工作结束。
+    private func presentImage(url: URL) {
+        guard !quitting else {
+            return
+        }
+        if !engine.state.isBusy {
+            closeToolbar()
+        }
+        let editor = ImageWatermarkController(url: url)
+        editor.onChange = { [weak self] in
+            self?.imageEditors.removeAll { $0.closed && !$0.hasWork }
+            self?.finishQuitIfPossible()
+        }
+        imageEditors.append(editor)
+        editor.present()
+    }
+
     /// 业务作用: 持有剪辑窗口直到后台工作清理完毕，避免应用退出打断文件发布。
     /// 参数说明:
     /// - urls: 已明确打开的视频来源，空数组表示从窗口内添加。
@@ -710,13 +757,25 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         editor.present(urls: urls)
     }
 
-    /// 业务作用: 将 Finder 主动打开的电影文件交给剪辑窗口，而不开始录制。
+    /// 业务作用: 将 Finder 主动打开的图片和电影分别交给对应编辑窗口。
     /// 参数说明:
     /// - application: 接收文件打开事件的当前应用。
-    /// - urls: 用户选择由本应用打开的视频文件。
-    /// 返回: 文件按给定顺序导入新计划，无法读取时由剪辑界面说明。
+    /// - urls: 用户选择由本应用打开的媒体文件。
+    /// 返回: 图片分别编辑，视频按给定顺序进入同一计划，无法读取时由对应界面说明。
     func application(_ application: NSApplication, open urls: [URL]) {
-        presentEditor(urls: urls)
+        var movies: [URL] = []
+        for url in urls {
+            if let type = try? url.resourceValues(forKeys: [.contentTypeKey]).contentType,
+                type.conforms(to: .image)
+            {
+                presentImage(url: url)
+            } else {
+                movies.append(url)
+            }
+        }
+        if !movies.isEmpty {
+            presentEditor(urls: movies)
+        }
     }
 
     /// 业务作用: 每次展开选项时反映真实设备与已保存设置。
@@ -729,6 +788,8 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let editorItem = menu.addItem(
             withTitle: "剪辑与拼接…", action: #selector(openEditor), keyEquivalent: "o")
         editorItem.target = self
+        let imageItem = menu.addItem(withTitle: "图片去水印…", action: #selector(openImage), keyEquivalent: "")
+        imageItem.target = self
         menu.addItem(.separator())
         if options.mode == .region, selection.isVisible {
             addOption("重新框选区域", value: "region:reset", checked: false, to: menu)
@@ -1054,6 +1115,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 $0.hasWork
             })
             && !editors.contains(where: { $0.hasWork })
+            && !imageEditors.contains(where: { $0.hasWork })
         {
             return .terminateNow
         }
@@ -1063,6 +1125,9 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         // 取消导出后必须等临时文件清理完毕，不能在取消请求发出时直接结束进程。
         for editor in editors where editor.hasWork {
+            editor.cancelWork()
+        }
+        for editor in imageEditors where editor.hasWork {
             editor.cancelWork()
         }
         return .terminateLater
@@ -1075,7 +1140,7 @@ final class AppController: NSObject, NSApplicationDelegate, NSMenuDelegate {
         if quitting, engine.canTerminate,
             !artifacts.contains(where: {
                 $0.hasWork
-            }), !editors.contains(where: { $0.hasWork })
+            }), !editors.contains(where: { $0.hasWork }), !imageEditors.contains(where: { $0.hasWork })
         {
             NSApp.reply(toApplicationShouldTerminate: true)
         }

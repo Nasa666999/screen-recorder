@@ -731,6 +731,11 @@ final class MovieWatermarkCanvas: NSView {
             needsDisplay = true
         }
     }
+    var savedRects: [CGRect] = [] {
+        didSet {
+            needsDisplay = true
+        }
+    }
     var isEnabled = true
     var onChange: (() -> Void)?
     private var anchor: NSPoint?
@@ -761,25 +766,47 @@ final class MovieWatermarkCanvas: NSView {
             image.draw(
                 in: imageRect, from: .zero, operation: .copy, fraction: 1, respectFlipped: true, hints: nil)
         }
-        guard showsOutline, let rect else {
+        guard showsOutline else {
             return
         }
+        for rect in savedRects {
+            drawOutline(rect, color: .systemCyan)
+        }
+        if let rect {
+            drawOutline(rect, color: .systemOrange)
+        }
+    }
+
+    /// 业务作用: 区分已保存区域与当前正在编辑的区域，框线只显示在编辑画布。
+    /// 参数说明:
+    /// - rect: 显示画面内的比例矩形。
+    /// - color: 当前区域的显示颜色。
+    /// 返回: 不改变来源像素或补全结果。
+    private func drawOutline(_ rect: CGRect, color: NSColor) {
         let visible = CGRect(
             x: imageRect.minX + rect.minX * imageRect.width,
             y: imageRect.minY + rect.minY * imageRect.height,
             width: rect.width * imageRect.width, height: rect.height * imageRect.height)
-        NSColor.systemOrange.withAlphaComponent(0.18).setFill()
+        color.withAlphaComponent(0.18).setFill()
         visible.fill()
         NSColor.white.setStroke()
         let outer = NSBezierPath(rect: visible)
         outer.lineWidth = 3
         outer.stroke()
-        NSColor.systemOrange.setStroke()
+        color.setStroke()
         outer.lineWidth = 1.5
         outer.stroke()
     }
 
-    /// 业务作用: 仅在真实视频画面内开始一次水印框选。
+    /// 业务作用: 接收激活窗口时的首次按下，保留用户直接拖框的起点。
+    /// 参数说明:
+    /// - event: 激活窗口的鼠标事件。
+    /// 返回: 画布可编辑时允许同一次按下开始框选，忙碌时保持禁止编辑。
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool {
+        isEnabled
+    }
+
+    /// 业务作用: 仅在真实媒体画面内开始一次水印框选。
     /// 参数说明:
     /// - event: 鼠标左键按下事件。
     /// 返回: 留黑区域和忙碌状态不启动框选。
